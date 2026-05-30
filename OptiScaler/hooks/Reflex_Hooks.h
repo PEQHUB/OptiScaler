@@ -1,6 +1,7 @@
 #pragma once
 #include <d3d12.h>
 #include <nvapi/NvApiTypes.h>
+#include <latency/NativeLowLatency.h>
 
 #include "Hook_Utils.h"
 
@@ -38,6 +39,7 @@ class ReflexHooks
     inline static HANDLE _lastVkSleepDev = nullptr;
 
     inline static std::thread::id _lastSetSleepThread {};
+    inline static bool _nativeLatencyInitialized = false;
 
     // D3D
     inline static decltype(&NvAPI_D3D_SetSleepMode) o_NvAPI_D3D_SetSleepMode = nullptr;

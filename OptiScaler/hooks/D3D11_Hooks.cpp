@@ -12,6 +12,7 @@
 
 #include <d3d11_4.h>
 #include <d3d11on12.h>
+#include <d3d12.h>
 #include <dxgi1_6.h>
 
 #include "Hook_Utils.h"
@@ -115,6 +116,61 @@ static void HookToDeviceLocal(ID3D11Device* InDevice)
     }
 }
 
+static void EnsureDx12DeviceForDx11FG(IDXGIAdapter* adapter)
+{
+    if (State::Instance().activeFgOutput == FGOutput::NoFG || State::Instance().dx12DeviceForDx11FG != nullptr ||
+        State::Instance().currentD3D12Device != nullptr)
+        return;
+
+    IDXGIAdapter* fgAdapter = adapter;
+    IDXGIFactory1* fgFactory = nullptr;
+
+    if (fgAdapter == nullptr)
+    {
+        if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&fgFactory))) && fgFactory != nullptr)
+            fgFactory->EnumAdapters(0, &fgAdapter);
+    }
+
+    if (fgAdapter != nullptr)
+    {
+        ID3D12Device* dx12Dev = nullptr;
+        if (SUCCEEDED(D3D12CreateDevice(fgAdapter, D3D_FEATURE_LEVEL_11_1, IID_PPV_ARGS(&dx12Dev))) &&
+            dx12Dev != nullptr)
+        {
+            D3D12_COMMAND_QUEUE_DESC qDesc = {};
+            qDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+
+            ID3D12CommandQueue* dx12Queue = nullptr;
+            if (SUCCEEDED(dx12Dev->CreateCommandQueue(&qDesc, IID_PPV_ARGS(&dx12Queue))) && dx12Queue != nullptr)
+            {
+                State::Instance().dx12DeviceForDx11FG = dx12Dev;
+                State::Instance().dx12QueueForDx11FG = dx12Queue;
+                State::Instance().currentD3D12Device = dx12Dev;
+                State::Instance().currentCommandQueue = dx12Queue;
+                LOG_INFO("DX11 FG: Created D3D12 device {:X} and queue {:X} for FG interop", (size_t) dx12Dev,
+                         (size_t) dx12Queue);
+            }
+            else
+            {
+                dx12Dev->Release();
+                LOG_WARN("DX11 FG: Failed to create D3D12 command queue");
+            }
+        }
+        else
+        {
+            LOG_WARN("DX11 FG: Failed to create D3D12 device on adapter");
+        }
+    }
+
+    if (fgFactory != nullptr)
+    {
+        if (adapter == nullptr && fgAdapter != nullptr)
+            fgAdapter->Release();
+
+        fgFactory->Release();
+    }
+}
+
 VALIDATE_HOOK(hkD3D11On12CreateDevice, PFN_D3D11ON12_CREATE_DEVICE)
 static HRESULT hkD3D11On12CreateDevice(IUnknown* pDevice, UINT Flags, const D3D_FEATURE_LEVEL* pFeatureLevels,
                                        UINT FeatureLevels, IUnknown* const* ppCommandQueues, UINT NumQueues,
@@ -129,15 +185,27 @@ static HRESULT hkD3D11On12CreateDevice(IUnknown* pDevice, UINT Flags, const D3D_
 
     bool rtss = false;
 
-    IUnknown* copyCommandQueues = *ppCommandQueues;
+    // In DX11 FG mode, block RTSS from creating D3D11On12 devices on our FG interop queue.
+    // RTSS will fall back to its DX11 overlay path, which avoids contention on the hidden DX12 queue.
+    if (State::Instance().dx11FGMode && GetModuleHandle(L"RTSSHooks64.dll") != nullptr)
+    {
+        LOG_INFO("DX11 FG mode: blocking RTSS D3D11On12 device creation to prevent queue contention");
+        if (ppDevice)
+            *ppDevice = nullptr;
+        if (ppImmediateContext)
+            *ppImmediateContext = nullptr;
+        return E_NOTIMPL;
+    }
+
+    IUnknown* copyCommandQueues = ppCommandQueues != nullptr && NumQueues > 0 ? *ppCommandQueues : nullptr;
 
     // Assuming RTSS is creating a D3D11on12 device, not sure why but sometimes RTSS tries to create
     // it's D3D11on12 device with old CommandQueue which results crash
     // I am changing it's CommandQueue with current swapchain's command queue
-    if (State::Instance().currentCommandQueue != nullptr && *ppCommandQueues != State::Instance().currentCommandQueue &&
+    if (State::Instance().currentCommandQueue != nullptr && copyCommandQueues != State::Instance().currentCommandQueue &&
         GetModuleHandle(L"RTSSHooks64.dll") != nullptr && pDevice == State::Instance().currentD3D12Device)
     {
-        LOG_INFO("Replaced RTSS CommandQueue with correct one {0:X} -> {1:X}", (UINT64) *ppCommandQueues,
+        LOG_INFO("Replaced RTSS CommandQueue with correct one {0:X} -> {1:X}", (UINT64) copyCommandQueues,
                  (UINT64) State::Instance().currentCommandQueue);
 
         copyCommandQueues = State::Instance().currentCommandQueue;
@@ -179,7 +247,15 @@ static HRESULT hkD3D11CreateDevice(IDXGIAdapter* pAdapter, D3D_DRIVER_TYPE Drive
                                    ppDevice, pFeatureLevel, ppImmediateContext);
     }
 
-    LOG_DEBUG("Caller: {}", Util::WhoIsTheCaller(_ReturnAddress()));
+    auto caller = Util::WhoIsTheCaller(_ReturnAddress());
+    LOG_DEBUG("Caller: {}", caller);
+
+    if (caller.find("dxdiagn") != std::string::npos || GetModuleHandleA("dxdiagn.dll") != nullptr)
+    {
+        LOG_DEBUG("Bypassing hook for diagnostic caller: {}", caller);
+        return o_D3D11CreateDevice(pAdapter, DriverType, Software, Flags, pFeatureLevels, FeatureLevels, SDKVersion,
+                                   ppDevice, pFeatureLevel, ppImmediateContext);
+    }
 
 #ifdef ENABLE_DEBUG_LAYER_DX11
     Flags |= D3D11_CREATE_DEVICE_DEBUG;
@@ -261,6 +337,7 @@ static HRESULT hkD3D11CreateDevice(IDXGIAdapter* pAdapter, D3D_DRIVER_TYPE Drive
             State::Instance().DeviceAdapterNames[*ppDevice] = wstring_to_string(szName);
 
         HookToDeviceLocal(*ppDevice);
+        EnsureDx12DeviceForDx11FG(pAdapter);
     }
 
     LOG_FUNC_RESULT(result);
@@ -288,7 +365,16 @@ static HRESULT hkD3D11CreateDeviceAndSwapChain(IDXGIAdapter* pAdapter, D3D_DRIVE
                                                ppImmediateContext);
     }
 
-    LOG_DEBUG("Caller: {}", Util::WhoIsTheCaller(_ReturnAddress()));
+    auto caller = Util::WhoIsTheCaller(_ReturnAddress());
+    LOG_DEBUG("Caller: {}", caller);
+
+    if (caller.find("dxdiagn") != std::string::npos || GetModuleHandleA("dxdiagn.dll") != nullptr)
+    {
+        LOG_DEBUG("Bypassing hook for diagnostic caller: {}", caller);
+        return o_D3D11CreateDeviceAndSwapChain(pAdapter, DriverType, Software, Flags, pFeatureLevels, FeatureLevels,
+                                               SDKVersion, pSwapChainDesc, ppSwapChain, ppDevice, pFeatureLevel,
+                                               ppImmediateContext);
+    }
 
 #ifdef ENABLE_DEBUG_LAYER_DX11
     Flags |= D3D11_CREATE_DEVICE_DEBUG;
@@ -402,6 +488,7 @@ static HRESULT hkD3D11CreateDeviceAndSwapChain(IDXGIAdapter* pAdapter, D3D_DRIVE
     {
         LOG_INFO("Device captured");
         HookToDeviceLocal(*ppDevice);
+        EnsureDx12DeviceForDx11FG(pAdapter);
     }
 
     if (result == S_OK && pSwapChainDesc != nullptr && ppSwapChain != nullptr && *ppSwapChain != nullptr &&

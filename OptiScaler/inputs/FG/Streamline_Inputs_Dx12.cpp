@@ -231,12 +231,20 @@ bool Sl_Inputs_Dx12::setConstants(const sl::Constants& values, uint32_t frameId)
         // bool multiplyByResolution = dataCopy.mvecScale.x != 1.f || dataCopy.mvecScale.y != 1.f;
         bool multiplyByResolution = true;
         if (multiplyByResolution)
-            fgOutput->SetMVScale(data.mvecScale.x * mvsWidth, data.mvecScale.y * mvsHeight);
+            fgOutput->SetMVScale(data.mvecScale.x * mvsWidth, data.mvecScale.y * mvsHeight, -1, true);
         else
             fgOutput->SetMVScale(data.mvecScale.x, data.mvecScale.y);
 
         fgOutput->SetCameraData(reinterpret_cast<float*>(&data.cameraPos), reinterpret_cast<float*>(&data.cameraUp),
                                 reinterpret_cast<float*>(&data.cameraRight), reinterpret_cast<float*>(&data.cameraFwd));
+
+        // Detect coordinate system handedness from the projection matrix's perspective divide direction.
+        // projMatrix[2][3] == +1 for LH, -1 for RH. The 'e' variable was extracted earlier in loadCameraMatrix.
+        {
+            float projMatrix[4][4];
+            memcpy(projMatrix, (void*) &data.cameraViewToClip, sizeof(projMatrix));
+            fgOutput->SetHandedness(projMatrix[2][3] >= 0.0f);
+        }
 
         fgOutput->SetReset(data.reset == sl::Boolean::eTrue);
 
@@ -414,6 +422,17 @@ bool Sl_Inputs_Dx12::reportResource(const sl::ResourceTag& tag, ID3D12GraphicsCo
         if (width == 0)
             fgOutput->SetInterpolationRect(res.width, res.height);
 
+        fgOutput->SetResource(&res);
+    }
+    else if (tag.type == sl::kBufferTypeBidirectionalDistortionField)
+    {
+        if (res.frameIndex < 0)
+        {
+            res.frameIndex = fgOutput->GetIndexWillBeDispatched();
+            if (fgOutput->HasResource(FG_ResourceType::Distortion, res.frameIndex))
+                res.frameIndex = fgOutput->GetIndex();
+        }
+        res.type = FG_ResourceType::Distortion;
         fgOutput->SetResource(&res);
     }
     else

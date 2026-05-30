@@ -58,7 +58,7 @@ DEFINE_NAME_VECTORS(blockOverlay, "eosovh-win32-shipping",
                                   "eosovh-win64-shipping",
                                   "gameoverlayrenderer",
                                   "gameoverlayrenderer64",
-                                  "owclient"
+                                  "owclient",
                                   "galaxy",
                                   "galaxy64",
                                   "discordhook",
@@ -87,7 +87,8 @@ DEFINE_NAME_VECTORS(skipDxgiWrapping, "eosovh-win32-shipping",
                                       "overlay64", // Overlays ended
                                       "d3d11",
                                       "d3d12",
-                                      "d3d12core" // DirectX ended
+                                      "d3d12core",
+                                      "dxdiagn" // diagnostics create temporary devices through hook chains
 /*
                                       "libxell.dll",
                                       "libxess.dll",

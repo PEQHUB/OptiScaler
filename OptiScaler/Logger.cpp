@@ -5,6 +5,7 @@
 
 #include "spdlog/async.h"
 #include "spdlog/sinks/basic_file_sink.h"
+#include "spdlog/sinks/null_sink.h"
 #include "spdlog/sinks/stdout_color_sinks.h"
 #include "spdlog/sinks/callback_sink.h"
 #include <include/spdlog_sink/debug_sink.h>
@@ -184,6 +185,14 @@ void PrepareLogger()
             shared_logger->flush_on(spdlog::level::trace);
 
             spdlog::set_default_logger(shared_logger);
+        }
+        else
+        {
+            // No logging outputs enabled — install a null sink so default_logger() is never nullptr
+            auto null_sink = std::make_shared<spdlog::sinks::null_sink_mt>();
+            auto null_logger = std::make_shared<spdlog::logger>("null", null_sink);
+            null_logger->set_level(spdlog::level::off);
+            spdlog::set_default_logger(null_logger);
         }
     }
     catch (const spdlog::spdlog_ex& ex)

@@ -395,8 +395,18 @@ VALIDATE_HOOK(hkD3D12CreateDevice, D3d12Proxy::PFN_D3D12CreateDevice)
 static HRESULT hkD3D12CreateDevice(IUnknown* pAdapter, D3D_FEATURE_LEVEL MinimumFeatureLevel, REFIID riid,
                                    void** ppDevice)
 {
-    LOG_DEBUG("Adapter: {:X}, Level: {:X}, Caller: {}", (size_t) pAdapter, (UINT) MinimumFeatureLevel,
-              Util::WhoIsTheCaller(_ReturnAddress()));
+    auto caller = Util::WhoIsTheCaller(_ReturnAddress());
+    LOG_DEBUG("Adapter: {:X}, Level: {:X}, Caller: {}", (size_t) pAdapter, (UINT) MinimumFeatureLevel, caller);
+
+    // Bypass hook processing for diagnostic DLLs — dxdiagn.dll creates 7+ temporary
+    // D3D12 devices in quick succession. The combined hook chain depth overflows
+    // the NVIDIA driver's stack (0xc00000fd at nvwgf2umx.dll+0xe4c937).
+    // Check both immediate caller AND if dxdiagn.dll is loaded (it routes through system DLLs).
+    if (caller.find("dxdiagn") != std::string::npos || GetModuleHandleA("dxdiagn.dll") != nullptr)
+    {
+        LOG_DEBUG("Bypassing hook for diagnostic caller (dxdiagn loaded): {}", caller);
+        return o_D3D12CreateDevice(pAdapter, MinimumFeatureLevel, riid, ppDevice);
+    }
 
 #ifdef ENABLE_DEBUG_LAYER_DX12
     LOG_WARN("Debug layers active!");
@@ -423,6 +433,8 @@ static HRESULT hkD3D12CreateDevice(IUnknown* pAdapter, D3D_FEATURE_LEVEL Minimum
         {
             szName = desc.Description;
             LOG_INFO("Adapter Desc: {}", wstring_to_string(szName));
+            if (desc.VendorId != 0 && State::Instance().gpuVendorId == 0)
+                State::Instance().gpuVendorId = desc.VendorId;
         }
     }
 
@@ -462,15 +474,25 @@ static HRESULT hkD3D12CreateDevice(IUnknown* pAdapter, D3D_FEATURE_LEVEL Minimum
     if (result == S_OK && ppDevice != nullptr && MinimumFeatureLevel != D3D_FEATURE_LEVEL_1_0_CORE)
     {
         LOG_DEBUG("Device captured: {0:X}", (size_t) *ppDevice);
-        State::Instance().currentD3D12Device = (ID3D12Device*) *ppDevice;
+
+        // Don't overwrite FG interop device with temporary dxdiagn.dll devices in DX11 FG mode
+        if (State::Instance().dx11FGMode && State::Instance().dx12DeviceForDx11FG != nullptr)
+        {
+            LOG_DEBUG("DX11 FG mode: not overwriting currentD3D12Device with {:X}", (size_t)*ppDevice);
+        }
+        else
+        {
+            State::Instance().currentD3D12Device = (ID3D12Device*) *ppDevice;
+        }
 
         if (szName.size() > 0)
             State::Instance().DeviceAdapterNames[*ppDevice] = wstring_to_string(szName);
 
+        auto* newDevice = (ID3D12Device*)*ppDevice;
         if (desc.VendorId == VendorId::Intel && Config::Instance()->UESpoofIntelAtomics64.value_or_default())
         {
-            IGDExtProxy::EnableAtomicSupport(State::Instance().currentD3D12Device);
-            _intelD3D12Device = State::Instance().currentD3D12Device;
+            IGDExtProxy::EnableAtomicSupport(newDevice);
+            _intelD3D12Device = newDevice;
             _intelD3D12DeviceRefTarget = _intelD3D12Device->AddRef();
 
             if (o_D3D12DeviceRelease == nullptr)
@@ -482,7 +504,7 @@ static HRESULT hkD3D12CreateDevice(IUnknown* pAdapter, D3D_FEATURE_LEVEL Minimum
         // if (Config::Instance()->UESpoofIntelAtomics64.value_or_default())
         //     UnhookDevice();
 
-        HookToDevice(State::Instance().currentD3D12Device);
+        HookToDevice(newDevice);
         _d3d12Captured = true;
 
         State::Instance().d3d12Devices.push_back((ID3D12Device*) *ppDevice);
@@ -558,6 +580,8 @@ static HRESULT hkCreateDevice(ID3D12DeviceFactory* pFactory, IUnknown* pAdapter,
         {
             szName = desc.Description;
             LOG_INFO("Adapter Desc: {}", wstring_to_string(szName));
+            if (desc.VendorId != 0 && State::Instance().gpuVendorId == 0)
+                State::Instance().gpuVendorId = desc.VendorId;
         }
     }
 
@@ -593,15 +617,25 @@ static HRESULT hkCreateDevice(ID3D12DeviceFactory* pFactory, IUnknown* pAdapter,
     if (result == S_OK && ppDevice != nullptr && MinimumFeatureLevel != D3D_FEATURE_LEVEL_1_0_CORE)
     {
         LOG_DEBUG("Device captured: {0:X}", (size_t) *ppDevice);
-        State::Instance().currentD3D12Device = (ID3D12Device*) *ppDevice;
+
+        // Don't overwrite FG interop device with temporary dxdiagn.dll devices in DX11 FG mode
+        if (State::Instance().dx11FGMode && State::Instance().dx12DeviceForDx11FG != nullptr)
+        {
+            LOG_DEBUG("DX11 FG mode: not overwriting currentD3D12Device with {:X}", (size_t)*ppDevice);
+        }
+        else
+        {
+            State::Instance().currentD3D12Device = (ID3D12Device*) *ppDevice;
+        }
 
         if (szName.size() > 0)
             State::Instance().DeviceAdapterNames[*ppDevice] = wstring_to_string(szName);
 
+        auto* newDevice = (ID3D12Device*)*ppDevice;
         if (desc.VendorId == VendorId::Intel && Config::Instance()->UESpoofIntelAtomics64.value_or_default())
         {
-            IGDExtProxy::EnableAtomicSupport(State::Instance().currentD3D12Device);
-            _intelD3D12Device = State::Instance().currentD3D12Device;
+            IGDExtProxy::EnableAtomicSupport(newDevice);
+            _intelD3D12Device = newDevice;
             _intelD3D12DeviceRefTarget = _intelD3D12Device->AddRef();
 
             if (o_D3D12DeviceRelease == nullptr)
@@ -610,7 +644,7 @@ static HRESULT hkCreateDevice(ID3D12DeviceFactory* pFactory, IUnknown* pAdapter,
                 o_D3D12DeviceRelease(_intelD3D12Device);
         }
 
-        HookToDevice(State::Instance().currentD3D12Device);
+        HookToDevice(newDevice);
         _d3d12Captured = true;
 
         State::Instance().d3d12Devices.push_back((ID3D12Device*) *ppDevice);

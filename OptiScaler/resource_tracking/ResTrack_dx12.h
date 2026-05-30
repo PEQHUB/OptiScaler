@@ -381,6 +381,13 @@ class ResTrack_Dx12
                                      D3D12_CPU_DESCRIPTOR_HANDLE* pDepthStencilDescriptor);
     static void hkSetComputeRootDescriptorTable(ID3D12GraphicsCommandList* This, UINT RootParameterIndex,
                                                 D3D12_GPU_DESCRIPTOR_HANDLE BaseDescriptor);
+    static void hkResourceBarrier(ID3D12GraphicsCommandList* This, UINT NumBarriers,
+                                  const D3D12_RESOURCE_BARRIER* pBarriers);
+    static void hkCopyResource(ID3D12GraphicsCommandList* This, ID3D12Resource* pDstResource,
+                               ID3D12Resource* pSrcResource);
+    static void hkCopyTextureRegion(ID3D12GraphicsCommandList* This,
+                                    const D3D12_TEXTURE_COPY_LOCATION* pDst, UINT DstX, UINT DstY, UINT DstZ,
+                                    const D3D12_TEXTURE_COPY_LOCATION* pSrc, const D3D12_BOX* pSrcBox);
 
     static void hkDrawInstanced(ID3D12GraphicsCommandList* This, UINT VertexCountPerInstance, UINT InstanceCount,
                                 UINT StartVertexLocation, UINT StartInstanceLocation);
@@ -392,6 +399,8 @@ class ResTrack_Dx12
     static void hkExecuteBundle(ID3D12GraphicsCommandList* This, ID3D12GraphicsCommandList* pCommandList);
 
     static HRESULT hkClose(ID3D12GraphicsCommandList* This);
+    static HRESULT hkReset(ID3D12GraphicsCommandList* This, ID3D12CommandAllocator* pAllocator,
+                           ID3D12PipelineState* pInitialState);
 
     static void hkCreateRenderTargetView(ID3D12Device* This, ID3D12Resource* pResource,
                                          D3D12_RENDER_TARGET_VIEW_DESC* pDesc,
@@ -405,6 +414,8 @@ class ResTrack_Dx12
 
     static void hkExecuteCommandLists(ID3D12CommandQueue* This, UINT NumCommandLists,
                                       ID3D12CommandList* const* ppCommandLists);
+    static HRESULT hkCommandQueueSignal(ID3D12CommandQueue* This, ID3D12Fence* pFence, UINT64 Value);
+    static HRESULT hkCommandQueueWait(ID3D12CommandQueue* This, ID3D12Fence* pFence, UINT64 Value);
 
     static HRESULT hkCreateDescriptorHeap(ID3D12Device* This, D3D12_DESCRIPTOR_HEAP_DESC* pDescriptorHeapDesc,
                                           REFIID riid, void** ppvHeap);

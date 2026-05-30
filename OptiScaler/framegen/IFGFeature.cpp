@@ -9,7 +9,8 @@ int IFGFeature::GetIndexWillBeDispatched()
     UINT64 df;
 
     auto diff = _frameCount - _lastDispatchedFrame;
-    if (diff > Config::Instance()->FGAllowedFrameAhead.value_or_default() || diff < 0 || _lastDispatchedFrame == 0)
+    if (diff > Config::Instance()->FGAllowedFrameAhead.value_or_default() || _lastDispatchedFrame > _frameCount ||
+        _lastDispatchedFrame == 0)
     {
         // If current index has resources, skip to it
         if (HasResource(FG_ResourceType::Depth))
@@ -131,7 +132,7 @@ bool IFGFeature::CheckForRealObject(std::string functionName, IUnknown* pObject,
     return false;
 }
 
-int IFGFeature::GetDispatchIndex(UINT64& willDispatchFrame)
+int IFGFeature::GetDispatchIndex(UINT64& willDispatchFrame, bool commit)
 {
     LOG_DEBUG("_lastDispatchedFrame: {},  _frameCount: {}", _lastDispatchedFrame, _frameCount);
 
@@ -142,7 +143,8 @@ int IFGFeature::GetDispatchIndex(UINT64& willDispatchFrame)
     willDispatchFrame = _lastDispatchedFrame + 1; // By default render next one
 
     auto diff = _frameCount - _lastDispatchedFrame;
-    if (diff > Config::Instance()->FGAllowedFrameAhead.value_or_default() || diff < 0 || _lastDispatchedFrame == 0)
+    if (diff > Config::Instance()->FGAllowedFrameAhead.value_or_default() || _lastDispatchedFrame > _frameCount ||
+        _lastDispatchedFrame == 0)
     {
         auto index = GetIndex();
 
@@ -153,8 +155,11 @@ int IFGFeature::GetDispatchIndex(UINT64& willDispatchFrame)
         }
     }
 
-    _lastDispatchedFrame = willDispatchFrame;
-    _lastFGFrame = State::Instance().FGLastFrame;
+    if (commit)
+    {
+        _lastDispatchedFrame = willDispatchFrame;
+        _lastFGFrame = State::Instance().FGLastFrame;
+    }
 
     return (willDispatchFrame % BUFFER_COUNT);
 }
@@ -201,13 +206,34 @@ void IFGFeature::SetJitter(float x, float y, int index)
     _jitterY[index] = y;
 }
 
-void IFGFeature::SetMVScale(float x, float y, int index)
+void IFGFeature::SetMVScale(float x, float y, int index, bool preMultiplied)
 {
     if (index < 0)
         index = GetIndex();
 
     _mvScaleX[index] = x;
     _mvScaleY[index] = y;
+    _mvScalePreMultiplied[index] = preMultiplied;
+}
+
+bool IFGFeature::IsMVScalePreMultiplied(int index)
+{
+    if (index < 0)
+        index = GetIndex();
+
+    return _mvScalePreMultiplied[index];
+}
+
+float IFGFeature::GetMVScaleX(int index)
+{
+    if (index < 0) index = GetIndex();
+    return _mvScaleX[index];
+}
+
+float IFGFeature::GetMVScaleY(int index)
+{
+    if (index < 0) index = GetIndex();
+    return _mvScaleY[index];
 }
 
 void IFGFeature::SetCameraValues(float nearValue, float farValue, float vFov, float aspectRatio, float meterFactor,
@@ -233,6 +259,14 @@ void IFGFeature::SetCameraData(float cameraPosition[3], float cameraUp[3], float
     std::memcpy(_cameraUp[index], cameraUp, 3 * sizeof(float));
     std::memcpy(_cameraRight[index], cameraRight, 3 * sizeof(float));
     std::memcpy(_cameraForward[index], cameraForward, 3 * sizeof(float));
+}
+
+void IFGFeature::SetHandedness(bool isLeftHanded, int index)
+{
+    if (index < 0)
+        index = GetIndex();
+
+    _isLeftHanded[index] = isLeftHanded;
 }
 
 void IFGFeature::SetFrameTimeDelta(double delta, int index)
@@ -319,3 +353,53 @@ void IFGFeature::SetResourceReady(FG_ResourceType type, int index)
 }
 
 UINT IFGFeature::GetInterpolatedFrameCount() { return _framesToInterpolate < 0 ? 1 : _framesToInterpolate; }
+
+void IFGFeature::SetClipToPrevClipMatrix(const float* matrix, int index)
+{
+    if (index < 0)
+        index = GetIndex();
+
+    std::memcpy(_clipToPrevClipMatrix[index], matrix, 16 * sizeof(float));
+    _hasClipToPrevClipMatrix[index] = true;
+}
+
+void IFGFeature::SetInvViewProjMatrix(const float* matrix, int index)
+{
+    if (index < 0)
+        index = GetIndex();
+
+    std::memcpy(_invViewProjMatrix[index], matrix, 16 * sizeof(float));
+    _hasInvViewProjMatrix[index] = true;
+}
+
+bool IFGFeature::HasClipToPrevClipMatrix(int index) const
+{
+    if (index < 0)
+        index = const_cast<IFGFeature*>(this)->GetIndex();
+
+    return _hasClipToPrevClipMatrix[index];
+}
+
+bool IFGFeature::HasInvViewProjMatrix(int index) const
+{
+    if (index < 0)
+        index = const_cast<IFGFeature*>(this)->GetIndex();
+
+    return _hasInvViewProjMatrix[index];
+}
+
+const float* IFGFeature::GetClipToPrevClipMatrix(int index) const
+{
+    if (index < 0)
+        index = const_cast<IFGFeature*>(this)->GetIndex();
+
+    return _clipToPrevClipMatrix[index];
+}
+
+const float* IFGFeature::GetInvViewProjMatrix(int index) const
+{
+    if (index < 0)
+        index = const_cast<IFGFeature*>(this)->GetIndex();
+
+    return _invViewProjMatrix[index];
+}

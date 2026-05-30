@@ -53,6 +53,7 @@ class IFGFeature
     float _jitterY[BUFFER_COUNT] = {};
     float _mvScaleX[BUFFER_COUNT] = {};
     float _mvScaleY[BUFFER_COUNT] = {};
+    bool _mvScalePreMultiplied[BUFFER_COUNT] = {}; ///< True if mvScale was pre-multiplied by MV dimensions (Streamline path)
     float _cameraNear[BUFFER_COUNT] = {};
     float _cameraFar[BUFFER_COUNT] = {};
     float _cameraVFov[BUFFER_COUNT] = {};
@@ -61,6 +62,13 @@ class IFGFeature
     float _cameraUp[BUFFER_COUNT][3] {};       ///< The camera up normalized vector in world space.
     float _cameraRight[BUFFER_COUNT][3] {};    ///< The camera right normalized vector in world space.
     float _cameraForward[BUFFER_COUNT][3] {};  ///< The camera forward normalized vector in world space.
+    bool _isLeftHanded[BUFFER_COUNT] = { true, true, true, true }; ///< Coordinate system handedness (LH default)
+
+    // NVNGX matrix parameters — some games provide these via DLSS upscaler params
+    float _clipToPrevClipMatrix[BUFFER_COUNT][16] {};
+    float _invViewProjMatrix[BUFFER_COUNT][16] {};
+    bool _hasClipToPrevClipMatrix[BUFFER_COUNT] {};
+    bool _hasInvViewProjMatrix[BUFFER_COUNT] {};
     float _meterFactor[BUFFER_COUNT] = {};
     double _ftDelta[BUFFER_COUNT] = {};
     UINT64 _interpolationWidth[BUFFER_COUNT] = {};
@@ -90,7 +98,7 @@ class IFGFeature
     IID streamlineRiid {};
 
     bool CheckForRealObject(std::string functionName, IUnknown* pObject, IUnknown** ppRealObject);
-    int GetDispatchIndex(UINT64& willDispatchFrame);
+    int GetDispatchIndex(UINT64& willDispatchFrame, bool commit = true);
     virtual void NewFrame() = 0;
 
   public:
@@ -127,6 +135,7 @@ class IFGFeature
     bool IsPaused();
     bool IsDispatched();
     bool IsLowResMV();
+    bool IsMVScalePreMultiplied(int index = -1);
     bool IsAsync();
     bool IsHdr();
     bool IsJitteredMVs();
@@ -135,11 +144,14 @@ class IFGFeature
 
     void SetFrameCount(UINT64 frameId);
     void SetJitter(float x, float y, int index = -1);
-    void SetMVScale(float x, float y, int index = -1);
+    void SetMVScale(float x, float y, int index = -1, bool preMultiplied = false);
+    float GetMVScaleX(int index = -1);
+    float GetMVScaleY(int index = -1);
     void SetCameraValues(float nearValue, float farValue, float vFov, float aspectRatio, float meterFactor = 0.0f,
                          int index = -1);
     void SetCameraData(float cameraPosition[3], float cameraUp[3], float cameraRight[3], float cameraForward[3],
                        int index = -1);
+    void SetHandedness(bool isLeftHanded, int index = -1);
     void SetFrameTimeDelta(double delta, int index = -1);
     void SetReset(UINT reset, int index = -1);
     void SetInterpolationRect(UINT64 width, UINT height, int index = -1);
@@ -148,6 +160,14 @@ class IFGFeature
     void GetInterpolationPos(UINT& left, UINT& top, int index = -1);
     void SetResourceReady(FG_ResourceType type, int index = -1);
     UINT GetInterpolatedFrameCount();
+
+    // NVNGX matrix accessors
+    void SetClipToPrevClipMatrix(const float* matrix, int index = -1);
+    void SetInvViewProjMatrix(const float* matrix, int index = -1);
+    bool HasClipToPrevClipMatrix(int index = -1) const;
+    bool HasInvViewProjMatrix(int index = -1) const;
+    const float* GetClipToPrevClipMatrix(int index = -1) const;
+    const float* GetInvViewProjMatrix(int index = -1) const;
 
     void ResetCounters();
     void UpdateTarget();

@@ -11,6 +11,7 @@
 #include "proxies/NVNGX_Proxy.h"
 
 #include <upscaler_time/UpscalerTime_Dx11.h>
+#include <inputs/FG/Upscaler_Inputs_Dx11.h>
 
 #include <ankerl/unordered_dense.h>
 
@@ -748,6 +749,7 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_EvaluateFeature(ID3D11DeviceConte
     }
 
     UpscalerTimeDx11::UpscaleStart(InDevCtx);
+    UpscalerInputsDx11::UpscaleStart(InDevCtx, InParameters, deviceContext);
 
     if (!deviceContext->Evaluate(InDevCtx, InParameters) && !deviceContext->IsInited() &&
         (deviceContext->Name() == "XeSS" || deviceContext->Name() == "DLSS" || deviceContext->Name() == "FSR3 w/Dx12"))
@@ -756,6 +758,7 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_EvaluateFeature(ID3D11DeviceConte
         State::Instance().changeBackend[handleId] = true;
     }
 
+    UpscalerInputsDx11::UpscaleEnd(InDevCtx, InParameters, deviceContext);
     UpscalerTimeDx11::UpscaleEnd(InDevCtx);
 
     return NVSDK_NGX_Result_Success;

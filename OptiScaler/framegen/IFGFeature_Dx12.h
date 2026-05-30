@@ -58,6 +58,20 @@ class IFGFeature_Dx12 : public virtual IFGFeature
     ID3D12CommandAllocator* _uiCommandAllocator[BUFFER_COUNT] {};
     bool _uiCommandListResetted[BUFFER_COUNT] { false, false, false, false };
 
+    // GPU fence for UI command allocator synchronization — ensures the GPU has finished
+    // executing the previous command list before we Reset() the allocator for reuse.
+    ID3D12Fence* _uiFence[BUFFER_COUNT] {};
+    UINT64 _uiFenceValue[BUFFER_COUNT] {};
+    HANDLE _uiFenceEvent = nullptr;
+
+    // Signal UI fence after ExecuteCommandLists for _uiCommandList[fIndex]
+    void SignalUIFence(int fIndex);
+    // Wait for UI fence before Reset() for _uiCommandAllocator[index]
+    void WaitUIFence(int index);
+    // Create/release fences (called from backend CreateObjects/ReleaseObjects)
+    bool CreateUIFences();
+    void ReleaseUIFences();
+
     std::unordered_map<FG_ResourceType, Dx12Resource> _frameResources[BUFFER_COUNT] {};
     std::unordered_map<FG_ResourceType, ID3D12Resource*> _resourceCopy[BUFFER_COUNT] {};
     std::shared_mutex _resourceMutex[BUFFER_COUNT];

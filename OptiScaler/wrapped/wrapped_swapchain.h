@@ -3,9 +3,11 @@
 #include "SysUtils.h"
 #include <OwnedMutex.h>
 #include <Config.h>
+#include <atomic>
 
 #include "dxgi1_6.h"
 #include "d3d12.h"
+#include "d3d11_4.h"
 
 #define USE_LOCAL_MUTEX
 
@@ -14,6 +16,13 @@ class DECLSPEC_UUID("3af622a3-82d0-49cd-994f-cce05122c222") WrappedIDXGISwapChai
   public:
     WrappedIDXGISwapChain4(IDXGISwapChain* real, IUnknown* pDevice, HWND hWnd, UINT flags, bool isUWP);
     virtual ~WrappedIDXGISwapChain4();
+
+    // DX11 Frame Generation proxy mode
+    bool InitDx11FGProxy(IDXGISwapChain* fgSwapChain, ID3D11Device* dx11Dev,
+                         ID3D12Device* dx12Dev, ID3D12CommandQueue* dx12Queue,
+                         DXGI_SWAP_CHAIN_DESC* desc);
+    void CleanupDx11FGProxy();
+    bool IsDx11FGProxy() const { return _dx11FGProxy; }
 
     // implement IUnknown
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override;
@@ -93,6 +102,42 @@ class DECLSPEC_UUID("3af622a3-82d0-49cd-994f-cce05122c222") WrappedIDXGISwapChai
     IUnknown* _device2 = nullptr;
 
     HWND _handle = nullptr;
+
+    // DX11 FG proxy mode members
+    bool _dx11FGProxy = false;
+    IDXGISwapChain* _fgSwapChain = nullptr;
+    ID3D11Device* _proxyDx11Device = nullptr;
+    ID3D12Device* _proxyDx12Device = nullptr;
+    ID3D12CommandQueue* _proxyDx12Queue = nullptr;
+    ID3D11Texture2D* _proxyBuffers[4] = {};
+    ID3D12Resource* _proxyDx12Resources[4] = {};
+    HANDLE _proxySharedHandles[4] = {};
+    UINT _proxyBufferCount = 0;
+    UINT _proxyCurrentBuffer = 0;
+    DXGI_SWAP_CHAIN_DESC _proxyDesc = {};
+    int _fgDisableCooldown = 0; // Frames to skip presenting after FG disable (Streamline drain)
+
+    // Deferred FG swapchain resize (set in ResizeBuffers, applied in Present)
+    std::atomic<bool> _pendingFGResize{false};
+    UINT _pendingResizeBufferCount = 0;
+    UINT _pendingResizeWidth = 0;
+    UINT _pendingResizeHeight = 0;
+    DXGI_FORMAT _pendingResizeFormat = DXGI_FORMAT_UNKNOWN;
+    UINT _pendingResizeFlags = 0;
+
+    // Shared fence for DX11→DX12 sync
+    ID3D11Fence* _proxyDx11Fence = nullptr;
+    ID3D12Fence* _proxyDx12Fence = nullptr;
+    HANDLE _proxyFenceSharedHandle = nullptr;
+    UINT64 _proxyFenceValue = 0;
+
+    // Frame pacing handled by Sleep(1) in Dx11FGProxyPresent — see comment there.
+
+    // DX12 copy infrastructure
+    ID3D12CommandAllocator* _proxyCopyAllocator = nullptr;
+    ID3D12GraphicsCommandList* _proxyCopyCmdList = nullptr;
+
+    HRESULT Dx11FGProxyPresent(UINT SyncInterval, UINT Flags);
 
 #ifdef USE_LOCAL_MUTEX
     OwnedMutex _localMutex;

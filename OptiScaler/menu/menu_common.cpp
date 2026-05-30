@@ -1,18 +1,22 @@
 ﻿#include "pch.h"
 #include "menu_common.h"
+#include <menu/menu_overlay_dx.h>
 
 #include "font/Hack_Compressed.h"
 
 #include <proxies/XeSS_Proxy.h>
 #include <proxies/XeFG_Proxy.h>
 #include <proxies/FfxApi_Proxy.h>
+#include <proxies/SL_Proxy.h>
 
 #include <inputs/FG/DLSSG_Mod.h>
+#include <framegen/dlssg/DLSSG_Native.h>
 
 #include <fsr4/FSR4Upgrade.h>
 
 #include <nvapi/fakenvapi.h>
 #include <hooks/Reflex_Hooks.h>
+#include <framewarp/FrameWarp.h>
 
 #include <version_check.h>
 
@@ -22,7 +26,10 @@
 #include <cstdarg>
 
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <cstring>
+#include <unordered_map>
 
 #define MARK_ALL_BACKENDS_CHANGED()                                                                                    \
     for (auto& singleChangeBackend : State::Instance().changeBackend)                                                  \
@@ -33,7 +40,7 @@ static ImVec2 overlaySize(0.0f, 0.0f);
 static ImVec2 overlayPosition(-1000.0f, -1000.0f);
 static bool _hdrTonemapApplied = false;
 static ImVec4 SdrColors[ImGuiCol_COUNT];
-static bool receivingWmInputs = false;
+// State::Instance().frameWarpReceivingWmInput moved to State::Instance().frameWarpReceivingWmInput
 static bool inputMenu = false;
 static bool inputFG = false;
 static bool inputFps = false;
@@ -47,6 +54,304 @@ static std::string currentBackend = "";
 static std::string currentBackendName = "";
 static int refreshRate = 0;
 static ImVec2 lastPosition(-1000.0f, -1000.0f);
+
+namespace
+{
+std::mutex g_frameWarpRawInputMutex;
+std::array<HRAWINPUT, 256> g_frameWarpRecentRawInputs {};
+size_t g_frameWarpRecentRawInputIndex = 0;
+
+enum class FrameWarpRawInputSourceKind : uint32_t
+{
+    Unknown = 0,
+    GetRawInputData = 1,
+    GetRawInputBuffer = 2,
+    Subclass = 3,
+};
+
+struct FrameWarpRawInputPacketIdentity
+{
+    FrameWarpRawInputSourceKind source = FrameWarpRawInputSourceKind::Unknown;
+    uint64_t key = 0;
+};
+
+std::array<FrameWarpRawInputPacketIdentity, 256> g_frameWarpRecentRawInputPacketIdentities {};
+size_t g_frameWarpRecentRawInputPacketIdentityIndex = 0;
+std::unordered_map<HWND, WNDPROC> g_frameWarpRawInputWndProcs;
+std::atomic<uint64_t> g_frameWarpRawInputBufferCallSequence { 0 };
+FrameWarpRawInputSourceKind g_frameWarpActiveRawInputSource = FrameWarpRawInputSourceKind::Unknown;
+
+int64_t FrameWarpRawInputNowQpc()
+{
+    LARGE_INTEGER counter {};
+    QueryPerformanceCounter(&counter);
+    return counter.QuadPart;
+}
+
+const char* FrameWarpRawInputSourceName(FrameWarpRawInputSourceKind source)
+{
+    switch (source)
+    {
+    case FrameWarpRawInputSourceKind::GetRawInputData: return "GetRawInputData";
+    case FrameWarpRawInputSourceKind::GetRawInputBuffer: return "GetRawInputBuffer";
+    case FrameWarpRawInputSourceKind::Subclass: return "subclass";
+    default: return "unknown";
+    }
+}
+
+FrameWarpRawInputSourceKind FrameWarpRawInputSourceFromName(const char* source)
+{
+    if (source == nullptr)
+        return FrameWarpRawInputSourceKind::Unknown;
+    if (std::strcmp(source, "GetRawInputData") == 0)
+        return FrameWarpRawInputSourceKind::GetRawInputData;
+    if (std::strcmp(source, "GetRawInputBuffer") == 0)
+        return FrameWarpRawInputSourceKind::GetRawInputBuffer;
+    if (std::strcmp(source, "subclass") == 0)
+        return FrameWarpRawInputSourceKind::Subclass;
+    return FrameWarpRawInputSourceKind::Unknown;
+}
+
+FrameWarpRawInputSourceKind FrameWarpConfiguredRawInputSourceMode()
+{
+    uint32_t mode = Config::Instance()->FrameWarpRawInputSourceMode.value_or_default();
+    if (mode > static_cast<uint32_t>(FrameWarpRawInputSourceKind::Subclass))
+        mode = 0;
+    return static_cast<FrameWarpRawInputSourceKind>(mode);
+}
+
+void FrameWarpResetRawInputIdentitiesLocked()
+{
+    g_frameWarpRecentRawInputs = {};
+    g_frameWarpRecentRawInputIndex = 0;
+    g_frameWarpRecentRawInputPacketIdentities = {};
+    g_frameWarpRecentRawInputPacketIdentityIndex = 0;
+}
+
+FrameWarpRawInputSourceKind FrameWarpResolveAutoRawInputSource(const State::FrameWarpStatus& status)
+{
+    if (status.rawInputBufferMessageCount > 0)
+        return FrameWarpRawInputSourceKind::GetRawInputBuffer;
+    if (status.rawInputDataMessageCount > 0)
+        return FrameWarpRawInputSourceKind::GetRawInputData;
+    if (status.rawInputSubclassMessageCount > 0)
+        return FrameWarpRawInputSourceKind::Subclass;
+    return FrameWarpRawInputSourceKind::Unknown;
+}
+
+bool FrameWarpPrepareRawInput(
+    const RAWINPUT& rawData,
+    HRAWINPUT hRawInput,
+    FrameWarpRawInputSourceKind sourceKind,
+    uint64_t packetKey,
+    bool& duplicate)
+{
+    (void)rawData;
+    duplicate = false;
+    auto& status = State::Instance().frameWarpStatus;
+    std::lock_guard lock(g_frameWarpRawInputMutex);
+
+    FrameWarpRawInputSourceKind desiredSource = FrameWarpConfiguredRawInputSourceMode();
+    if (desiredSource == FrameWarpRawInputSourceKind::Unknown)
+        desiredSource = FrameWarpResolveAutoRawInputSource(status);
+
+    if (desiredSource == FrameWarpRawInputSourceKind::Unknown)
+        desiredSource = sourceKind;
+
+    if (g_frameWarpActiveRawInputSource != desiredSource)
+    {
+        const FrameWarpRawInputSourceKind previousSource = g_frameWarpActiveRawInputSource;
+        g_frameWarpActiveRawInputSource = desiredSource;
+        FrameWarpResetRawInputIdentitiesLocked();
+        strncpy_s(status.activeRawInputSource, FrameWarpRawInputSourceName(desiredSource), _TRUNCATE);
+
+        if (previousSource != FrameWarpRawInputSourceKind::Unknown)
+        {
+            status.rawInputInactiveSourceCount++;
+            LOG_DEBUG("FrameWarp: raw input source switched {} -> {}; dropping transition packet from {}",
+                FrameWarpRawInputSourceName(previousSource),
+                FrameWarpRawInputSourceName(desiredSource),
+                FrameWarpRawInputSourceName(sourceKind));
+            return false;
+        }
+    }
+
+    strncpy_s(status.activeRawInputSource, FrameWarpRawInputSourceName(g_frameWarpActiveRawInputSource), _TRUNCATE);
+    if (sourceKind != g_frameWarpActiveRawInputSource)
+    {
+        status.rawInputInactiveSourceCount++;
+        return false;
+    }
+
+    if (hRawInput != nullptr)
+    {
+        for (auto recent : g_frameWarpRecentRawInputs)
+        {
+            if (recent == hRawInput)
+            {
+                duplicate = true;
+                return false;
+            }
+        }
+
+        g_frameWarpRecentRawInputs[g_frameWarpRecentRawInputIndex] = hRawInput;
+        g_frameWarpRecentRawInputIndex = (g_frameWarpRecentRawInputIndex + 1) % g_frameWarpRecentRawInputs.size();
+        return true;
+    }
+
+    if (packetKey != 0)
+    {
+        for (const auto& recent : g_frameWarpRecentRawInputPacketIdentities)
+        {
+            if (recent.source == sourceKind && recent.key == packetKey)
+            {
+                duplicate = true;
+                return false;
+            }
+        }
+
+        g_frameWarpRecentRawInputPacketIdentities[g_frameWarpRecentRawInputPacketIdentityIndex] = {
+            sourceKind,
+            packetKey,
+        };
+        g_frameWarpRecentRawInputPacketIdentityIndex =
+            (g_frameWarpRecentRawInputPacketIdentityIndex + 1) % g_frameWarpRecentRawInputPacketIdentities.size();
+        return true;
+    }
+
+    status.rawInputUnidentifiedCount++;
+    return true;
+}
+
+void FrameWarpCopyStatusText(char* dest, size_t destSize, const char* text)
+{
+    if (dest == nullptr || destSize == 0)
+        return;
+
+    if (text == nullptr)
+        text = "";
+
+    strncpy_s(dest, destSize, text, _TRUNCATE);
+}
+
+bool FrameWarpForwardRawMouse(const RAWINPUT& rawData, HRAWINPUT hRawInput, const char* source, uint64_t packetKey = 0)
+{
+    if (rawData.header.dwType != RIM_TYPEMOUSE)
+        return false;
+
+    auto& state = State::Instance();
+    auto& status = state.frameWarpStatus;
+    const LONG dx = rawData.data.mouse.lLastX;
+    const LONG dy = rawData.data.mouse.lLastY;
+    const int64_t timestampQpc = FrameWarpRawInputNowQpc();
+    const FrameWarpRawInputSourceKind sourceKind = FrameWarpRawInputSourceFromName(source);
+    const char* sourceName = FrameWarpRawInputSourceName(sourceKind);
+
+    status.rawInputMessageCount++;
+    status.lastRawInputDx = dx;
+    status.lastRawInputDy = dy;
+    FrameWarpCopyStatusText(status.lastRawInputSource, sizeof(status.lastRawInputSource), sourceName);
+    state.frameWarpReceivingWmInput = true;
+
+    if (sourceKind == FrameWarpRawInputSourceKind::GetRawInputData)
+    {
+        status.rawInputDataHookSeen = true;
+        status.rawInputDataMessageCount++;
+    }
+    else if (sourceKind == FrameWarpRawInputSourceKind::GetRawInputBuffer)
+    {
+        status.rawInputBufferHookSeen = true;
+        status.rawInputBufferMessageCount++;
+    }
+    else if (sourceKind == FrameWarpRawInputSourceKind::Subclass)
+    {
+        status.rawInputSubclassSeen = true;
+        status.rawInputSubclassMessageCount++;
+    }
+
+    bool duplicate = false;
+    if (!FrameWarpPrepareRawInput(rawData, hRawInput, sourceKind, packetKey, duplicate))
+    {
+        if (duplicate)
+            status.rawInputDuplicateCount++;
+        return true;
+    }
+
+    if ((rawData.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) != 0 || (dx == 0 && dy == 0))
+    {
+        status.rawInputIgnoredCount++;
+        return true;
+    }
+
+    const bool forwarded = state.frameWarpRawMouseCallback != nullptr;
+    if (forwarded)
+    {
+        state.frameWarpRawMouseCallback(dx, dy, sourceName, timestampQpc);
+        status.rawInputSeen = true;
+        status.rawInputForwardedCount++;
+        if (sourceKind == FrameWarpRawInputSourceKind::GetRawInputData)
+            status.rawInputDataForwardedCount++;
+        else if (sourceKind == FrameWarpRawInputSourceKind::GetRawInputBuffer)
+            status.rawInputBufferForwardedCount++;
+        else if (sourceKind == FrameWarpRawInputSourceKind::Subclass)
+            status.rawInputSubclassForwardedCount++;
+    }
+    else
+    {
+        status.rawInputDroppedNoCallbackCount++;
+    }
+
+    if (status.rawInputMessageCount <= 10 || status.rawInputMessageCount % 1000 == 0)
+    {
+        LOG_DEBUG("FrameWarp: raw mouse source={} dx={} dy={} forwarded={} messages={} samples={}",
+            sourceName, dx, dy, forwarded, status.rawInputMessageCount, status.rawInputSampleCount);
+    }
+
+    return true;
+}
+
+WNDPROC FrameWarpGetTrackedWndProc(HWND hWnd)
+{
+    std::lock_guard lock(g_frameWarpRawInputMutex);
+    auto it = g_frameWarpRawInputWndProcs.find(hWnd);
+    return it != g_frameWarpRawInputWndProcs.end() ? it->second : nullptr;
+}
+
+void FrameWarpForgetTrackedWndProc(HWND hWnd)
+{
+    std::lock_guard lock(g_frameWarpRawInputMutex);
+    g_frameWarpRawInputWndProcs.erase(hWnd);
+}
+
+bool FrameWarpFindRegisteredRawMouse(HWND* target, DWORD* flags)
+{
+    UINT deviceCount = 0;
+    if (GetRegisteredRawInputDevices(nullptr, &deviceCount, sizeof(RAWINPUTDEVICE)) == (UINT)-1 ||
+        deviceCount == 0)
+    {
+        return false;
+    }
+
+    std::vector<RAWINPUTDEVICE> devices(deviceCount);
+    UINT copiedCount = GetRegisteredRawInputDevices(devices.data(), &deviceCount, sizeof(RAWINPUTDEVICE));
+    if (copiedCount == (UINT)-1)
+        return false;
+
+    for (UINT i = 0; i < copiedCount; i++)
+    {
+        if (devices[i].usUsagePage == 0x01 && devices[i].usUsage == 0x02)
+        {
+            if (target != nullptr)
+                *target = devices[i].hwndTarget;
+            if (flags != nullptr)
+                *flags = devices[i].dwFlags;
+            return true;
+        }
+    }
+
+    return false;
+}
+}
 
 static ImVec2 splashPosition(-1000.0f, -1000.0f);
 static ImVec2 splashSize(0.0f, 0.0f);
@@ -194,6 +499,21 @@ struct FsExistsCache
 };
 
 static FsExistsCache gExists;
+static FsExistsCache gStreamlineExists;
+
+static bool StreamlineFilesAvailableForSelection()
+{
+    auto& state = State::Instance();
+    if (SLProxy::IsReady())
+    {
+        state.SLFilesAvailable = true;
+        return true;
+    }
+
+    auto slInterposerPath = Util::DllPath().parent_path() / L"sl" / L"sl.interposer.dll";
+    state.SLFilesAvailable = gStreamlineExists.Get(slInterposerPath.wstring());
+    return state.SLFilesAvailable;
+}
 
 inline std::string StrFmt(const char* fmt, ...)
 {
@@ -320,6 +640,160 @@ UINT MenuCommon::hkSendInput(UINT cInputs, LPINPUT pInputs, int cbSize)
         return pfn_SendInput(cInputs, pInputs, cbSize);
 }
 
+BOOL MenuCommon::hkRegisterRawInputDevices(PCRAWINPUTDEVICE pRawInputDevices, UINT uiNumDevices, UINT cbSize)
+{
+    BOOL result = pfn_RegisterRawInputDevices(pRawInputDevices, uiNumDevices, cbSize);
+
+    // Windows has one raw-input registration per mouse usage per process. We let the
+    // game's registration win, then observe its GetRawInputData/GetRawInputBuffer reads
+    // and subclass explicit target HWNDs for titles that route WM_INPUT to helper windows.
+    if (result && State::Instance().frameWarpHwnd != nullptr)
+    {
+        for (UINT i = 0; i < uiNumDevices; i++)
+        {
+            if (pRawInputDevices[i].usUsagePage == 0x01 && pRawInputDevices[i].usUsage == 0x02)
+            {
+                auto& status = State::Instance().frameWarpStatus;
+                status.rawInputRegistrationSeen = true;
+                LOG_TRACE("FrameWarp: Game registered raw mouse input (flags=0x{:X}, hwnd={})",
+                    pRawInputDevices[i].dwFlags, (void*)pRawInputDevices[i].hwndTarget);
+                if ((pRawInputDevices[i].dwFlags & RIDEV_REMOVE) == 0 && pRawInputDevices[i].hwndTarget != nullptr)
+                    TrackFrameWarpRawInputWindow(pRawInputDevices[i].hwndTarget);
+            }
+        }
+    }
+
+    return result;
+}
+
+UINT MenuCommon::hkGetRawInputData(HRAWINPUT hRawInput, UINT uiCommand, LPVOID pData, PUINT pcbSize,
+                                   UINT cbSizeHeader)
+{
+    UINT result = pfn_GetRawInputData(hRawInput, uiCommand, pData, pcbSize, cbSizeHeader);
+
+    if (result != (UINT)-1 && uiCommand == RID_INPUT && pData != nullptr && result >= sizeof(RAWINPUTHEADER))
+    {
+        const auto* rawData = reinterpret_cast<const RAWINPUT*>(pData);
+        const UINT bytesAvailable = rawData->header.dwSize != 0 ? rawData->header.dwSize : result;
+        if (bytesAvailable >= sizeof(RAWINPUTHEADER) + sizeof(RAWMOUSE))
+            FrameWarpForwardRawMouse(*rawData, hRawInput, "GetRawInputData");
+    }
+
+    return result;
+}
+
+UINT MenuCommon::hkGetRawInputBuffer(PRAWINPUT pData, PUINT pcbSize, UINT cbSizeHeader)
+{
+    UINT result = pfn_GetRawInputBuffer(pData, pcbSize, cbSizeHeader);
+
+    if (result != (UINT)-1 && result > 0 && pData != nullptr && pcbSize != nullptr)
+    {
+        RAWINPUT* rawData = pData;
+        BYTE* bufferBegin = reinterpret_cast<BYTE*>(pData);
+        BYTE* bufferEnd = bufferBegin + *pcbSize;
+        const uint64_t bufferCallSequence =
+            g_frameWarpRawInputBufferCallSequence.fetch_add(1, std::memory_order_relaxed) + 1;
+        for (UINT i = 0; i < result; i++)
+        {
+            BYTE* packetBegin = reinterpret_cast<BYTE*>(rawData);
+            if (packetBegin + sizeof(RAWINPUTHEADER) > bufferEnd ||
+                rawData->header.dwSize < sizeof(RAWINPUTHEADER) ||
+                packetBegin + rawData->header.dwSize > bufferEnd)
+            {
+                State::Instance().frameWarpStatus.rawInputIgnoredCount++;
+                break;
+            }
+
+            const uint64_t packetKey = (bufferCallSequence << 32) ^ static_cast<uint64_t>(i + 1);
+            FrameWarpForwardRawMouse(*rawData, nullptr, "GetRawInputBuffer", packetKey != 0 ? packetKey : 1);
+            rawData = reinterpret_cast<RAWINPUT*>(packetBegin + rawData->header.dwSize);
+        }
+    }
+
+    return result;
+}
+
+void MenuCommon::ReadFrameWarpRawInput(HRAWINPUT hRawInput, const char* source, HWND hWnd)
+{
+    RAWINPUT rawData {};
+    UINT rawDataSize = sizeof(rawData);
+    PFN_GetRawInputData readRawInputData = pfn_GetRawInputData != nullptr ? pfn_GetRawInputData : &GetRawInputData;
+
+    if (readRawInputData(hRawInput, RID_INPUT, &rawData, &rawDataSize, sizeof(RAWINPUTHEADER)) != (UINT)-1)
+    {
+        (void)hWnd;
+        FrameWarpForwardRawMouse(rawData, hRawInput, source);
+    }
+}
+
+LRESULT WINAPI MenuCommon::FrameWarpRawInputWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    if (msg == WM_INPUT)
+        ReadFrameWarpRawInput(reinterpret_cast<HRAWINPUT>(lParam), "subclass", hWnd);
+
+    WNDPROC originalWndProc = FrameWarpGetTrackedWndProc(hWnd);
+    LRESULT result = originalWndProc != nullptr
+        ? CallWindowProc(originalWndProc, hWnd, msg, wParam, lParam)
+        : DefWindowProc(hWnd, msg, wParam, lParam);
+
+    if (msg == WM_NCDESTROY)
+        FrameWarpForgetTrackedWndProc(hWnd);
+
+    return result;
+}
+
+void MenuCommon::TrackFrameWarpRawInputWindow(HWND hWnd)
+{
+    if (hWnd == nullptr || hWnd == State::Instance().frameWarpHwnd)
+        return;
+
+    {
+        std::lock_guard lock(g_frameWarpRawInputMutex);
+        if (g_frameWarpRawInputWndProcs.find(hWnd) != g_frameWarpRawInputWndProcs.end())
+            return;
+    }
+
+    auto currentWndProc = reinterpret_cast<WNDPROC>(GetWindowLongPtr(hWnd, GWLP_WNDPROC));
+    if (currentWndProc == nullptr || currentWndProc == FrameWarpRawInputWndProc || currentWndProc == WndProc)
+        return;
+
+    SetLastError(0);
+    auto previousWndProc = reinterpret_cast<WNDPROC>(
+        SetWindowLongPtr(hWnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(FrameWarpRawInputWndProc)));
+    DWORD lastError = GetLastError();
+
+    if (previousWndProc == nullptr && lastError != ERROR_SUCCESS)
+    {
+        LOG_WARN("FrameWarp: failed to subclass raw input target hwnd={} err={}", (void*)hWnd, lastError);
+        return;
+    }
+
+    {
+        std::lock_guard lock(g_frameWarpRawInputMutex);
+        g_frameWarpRawInputWndProcs[hWnd] = previousWndProc;
+    }
+
+    LOG_INFO("FrameWarp: subclassed raw input target hwnd={} previous={}", (void*)hWnd, (void*)previousWndProc);
+}
+
+void MenuCommon::RestoreFrameWarpRawInputWindows()
+{
+    std::unordered_map<HWND, WNDPROC> trackedWndProcs;
+    {
+        std::lock_guard lock(g_frameWarpRawInputMutex);
+        trackedWndProcs.swap(g_frameWarpRawInputWndProcs);
+    }
+
+    for (const auto& [hWnd, wndProc] : trackedWndProcs)
+    {
+        if (hWnd != nullptr && wndProc != nullptr &&
+            reinterpret_cast<WNDPROC>(GetWindowLongPtr(hWnd, GWLP_WNDPROC)) == FrameWarpRawInputWndProc)
+        {
+            SetWindowLongPtr(hWnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(wndProc));
+        }
+    }
+}
+
 void MenuCommon::AttachHooks()
 {
     DetourTransactionBegin();
@@ -333,6 +807,11 @@ void MenuCommon::AttachHooks()
     pfn_mouse_event = reinterpret_cast<PFN_mouse_event>(DetourFindFunction("user32.dll", "mouse_event"));
     pfn_SendInput = reinterpret_cast<PFN_SendInput>(DetourFindFunction("user32.dll", "SendInput"));
     pfn_SendMessageW = reinterpret_cast<PFN_SendMessageW>(DetourFindFunction("user32.dll", "SendMessageW"));
+    pfn_RegisterRawInputDevices =
+        reinterpret_cast<PFN_RegisterRawInputDevices>(DetourFindFunction("user32.dll", "RegisterRawInputDevices"));
+    pfn_GetRawInputData = reinterpret_cast<PFN_GetRawInputData>(DetourFindFunction("user32.dll", "GetRawInputData"));
+    pfn_GetRawInputBuffer =
+        reinterpret_cast<PFN_GetRawInputBuffer>(DetourFindFunction("user32.dll", "GetRawInputBuffer"));
 
     if (pfn_SetPhysicalCursorPos && (pfn_SetPhysicalCursorPos != pfn_SetCursorPos))
         pfn_SetPhysicalCursorPos_hooked =
@@ -353,7 +832,36 @@ void MenuCommon::AttachHooks()
     if (pfn_SendMessageW)
         pfn_SendMessageW_hooked = (DetourAttach(&(PVOID&) pfn_SendMessageW, hkSendMessageW) == 0);
 
-    DetourTransactionCommit();
+    if (pfn_RegisterRawInputDevices)
+        pfn_RegisterRawInputDevices_hooked =
+            (DetourAttach(&(PVOID&) pfn_RegisterRawInputDevices, hkRegisterRawInputDevices) == 0);
+
+    if (pfn_GetRawInputData)
+        pfn_GetRawInputData_hooked = (DetourAttach(&(PVOID&) pfn_GetRawInputData, hkGetRawInputData) == 0);
+
+    if (pfn_GetRawInputBuffer)
+        pfn_GetRawInputBuffer_hooked = (DetourAttach(&(PVOID&) pfn_GetRawInputBuffer, hkGetRawInputBuffer) == 0);
+
+    LONG commitResult = DetourTransactionCommit();
+    if (commitResult != NO_ERROR)
+    {
+        LOG_WARN("MenuCommon::AttachHooks DetourTransactionCommit failed: {}", commitResult);
+        pfn_SetPhysicalCursorPos_hooked = false;
+        pfn_SetCursorPos_hooked = false;
+        pfn_ClipCursor_hooked = false;
+        pfn_mouse_event_hooked = false;
+        pfn_SendInput_hooked = false;
+        pfn_SendMessageW_hooked = false;
+        pfn_RegisterRawInputDevices_hooked = false;
+        pfn_GetRawInputData_hooked = false;
+        pfn_GetRawInputBuffer_hooked = false;
+    }
+
+    LOG_INFO("MenuCommon::AttachHooks SetCursorPos={} ClipCursor={} mouse_event={} SendInput={} SendMessageW={} "
+             "RegisterRawInput={} GetRawInputData={} GetRawInputBuffer={}",
+        pfn_SetCursorPos_hooked, pfn_ClipCursor_hooked, pfn_mouse_event_hooked,
+        pfn_SendInput_hooked, pfn_SendMessageW_hooked, pfn_RegisterRawInputDevices_hooked,
+        pfn_GetRawInputData_hooked, pfn_GetRawInputBuffer_hooked);
 }
 
 void MenuCommon::DetachHooks()
@@ -379,19 +887,38 @@ void MenuCommon::DetachHooks()
     if (pfn_SendMessageW_hooked)
         DetourDetach(&(PVOID&) pfn_SendMessageW, hkSendMessageW);
 
+    if (pfn_RegisterRawInputDevices_hooked)
+        DetourDetach(&(PVOID&) pfn_RegisterRawInputDevices, hkRegisterRawInputDevices);
+
+    if (pfn_GetRawInputData_hooked)
+        DetourDetach(&(PVOID&) pfn_GetRawInputData, hkGetRawInputData);
+
+    if (pfn_GetRawInputBuffer_hooked)
+        DetourDetach(&(PVOID&) pfn_GetRawInputBuffer, hkGetRawInputBuffer);
+
     pfn_SetPhysicalCursorPos_hooked = false;
     pfn_SetCursorPos_hooked = false;
+    pfn_ClipCursor_hooked = false;
     pfn_mouse_event_hooked = false;
     pfn_SendInput_hooked = false;
     pfn_SendMessageW_hooked = false;
+    pfn_RegisterRawInputDevices_hooked = false;
+    pfn_GetRawInputData_hooked = false;
+    pfn_GetRawInputBuffer_hooked = false;
 
     pfn_SetPhysicalCursorPos = nullptr;
     pfn_SetCursorPos = nullptr;
+    pfn_ClipCursor = nullptr;
     pfn_mouse_event = nullptr;
     pfn_SendInput = nullptr;
     pfn_SendMessageW = nullptr;
+    pfn_RegisterRawInputDevices = nullptr;
+    pfn_GetRawInputData = nullptr;
+    pfn_GetRawInputBuffer = nullptr;
 
     DetourTransactionCommit();
+
+    RestoreFrameWarpRawInputWindows();
 }
 
 ImGuiKey MenuCommon::ImGui_ImplWin32_VirtualKeyToImGuiKey(WPARAM wParam)
@@ -780,11 +1307,15 @@ LRESULT MenuCommon::WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
     UINT rawDataSize = sizeof(rawData);
 
     if (msg == WM_INPUT && GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, &rawData, &rawDataSize,
-                                           sizeof(rawData.data)) != (UINT) -1)
+                                           sizeof(RAWINPUTHEADER)) != (UINT) -1)
     {
         auto rawCode = GET_RAWINPUT_CODE_WPARAM(wParam);
         rawRead = true;
-        receivingWmInputs = true;
+        State::Instance().frameWarpReceivingWmInput = true;
+        static int wmInputCount = 0;
+        if (++wmInputCount <= 5 || wmInputCount % 1000 == 0)
+            LOG_DEBUG("FrameWarp: WM_INPUT received (count={}, type={}, code={})",
+                wmInputCount, rawData.header.dwType, rawCode);
         bool isKeyUp = (rawData.data.keyboard.Flags & RI_KEY_BREAK) != 0;
         if (isKeyUp && rawData.header.dwType == RIM_TYPEKEYBOARD && rawData.data.keyboard.VKey != 0)
         {
@@ -803,6 +1334,8 @@ LRESULT MenuCommon::WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 inputFpsCycle =
                     rawData.data.keyboard.VKey == Config::Instance()->FpsCycleShortcutKey.value_or_default();
         }
+        // FrameWarp mouse deltas are forwarded by hkGetRawInputData/hkGetRawInputBuffer
+        // so the game and helper HWND paths are deduplicated in one place.
     }
 
     if (!lastKey && msg == WM_KEYUP)
@@ -1824,6 +2357,9 @@ bool MenuCommon::RenderMenu()
     auto& state = State::Instance();
     auto config = Config::Instance();
 
+    // Sync Frame Warp debug overlay state from config (handles startup + config changes)
+    state.frameWarpDebugOverlay = config->FrameWarpDebug.value_or_default();
+
     _frameCount++;
 
     // FPS & frame time calculation
@@ -1904,6 +2440,7 @@ bool MenuCommon::RenderMenu()
                 config->ReloadFakenvapi();
                 auto dllPath = Util::DllPath().parent_path() / "dlssg_to_fsr3_amd_is_better.dll";
                 state.NukemsFilesAvailable = gExists.Get(dllPath);
+                StreamlineFilesAvailableForSelection();
 
                 if (State::Instance().currentFeature != nullptr)
                 {
@@ -1993,7 +2530,7 @@ bool MenuCommon::RenderMenu()
 
     // New frame check
     if ((!config->DisableSplash.value_or_default() && now > splashStart && now < splashLimit) ||
-        (updateNoticeVisible && now < updateNoticeLimit) || config->ShowFps.value_or_default() || _isVisible)
+        (updateNoticeVisible && now < updateNoticeLimit) || config->ShowFps.value_or_default() || _isVisible || State::Instance().frameWarpDebugOverlay)
     {
         if (!_isUWP)
         {
@@ -2566,8 +3103,203 @@ bool MenuCommon::RenderMenu()
                 overlayPosition.y = io.DisplaySize.y - overlaySize.y - splashSize.y;
             else
                 overlayPosition.y = io.DisplaySize.y - overlaySize.y;
+            }
         }
+
+        // ---- VibeFlex 2 Debug Overlay ----
+    if (State::Instance().frameWarpDebugOverlay && State::Instance().frameWarpStatus.available)
+    {
+        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 280.0f, 10.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowBgAlpha(0.7f);
+        ImGui::Begin("VibeFlex 2 Debug", nullptr, ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoDecoration);
+        {
+            auto& fw = State::Instance().frameWarpStatus;
+            ImVec4 titleColor = fw.lastWarpApplied ? ImVec4(0.2f, 1.0f, 0.4f, 1.0f) : ImVec4(1.0f, 0.4f, 0.4f, 1.0f);
+            ImGui::TextColored(titleColor, "FRAME WARP %s", fw.lastWarpApplied ? "[ACTIVE]" : "[IDLE]");
+            ImGui::Separator();
+            ImGui::Text("Owner: %s", fw.lastPresentationOwnerName[0] ? fw.lastPresentationOwnerName : "unknown");
+            ImGui::Text("Owner Reason: %s", fw.lastPresentationOwnerReason[0] ? fw.lastPresentationOwnerReason : "unknown");
+            ImGui::Text("FG Req/Active/Paused/CB: %s / %s / %s / %s",
+                fw.lastOwnerFgRequested ? "Y" : "N",
+                fw.lastOwnerFgActive ? "Y" : "N",
+                fw.lastOwnerFgPaused ? "Y" : "N",
+                fw.fsrfgPresentCallbackConfigured ? "Y" : "N");
+            ImGui::Text("WithFG: %s raw=%s resolved=%s",
+                fw.frameWarpWithFgSource[0] ? fw.frameWarpWithFgSource : "unknown",
+                fw.frameWarpWithFgConfigured ? (fw.frameWarpWithFgRawValue ? "true" : "false") : "auto",
+                fw.frameWarpWithFgResolved ? "true" : "false");
+            ImGui::Text("FSRFG: #%llu frame=%llu phase=%s policy=%s reuse=%s",
+                fw.fsrfgPresentCallbackOrdinal,
+                fw.fsrfgPresentCallbackFrameID,
+                fw.fsrfgLastPhase[0] ? fw.fsrfgLastPhase : "none",
+                fw.fsrfgLastPolicy[0] ? fw.fsrfgLastPolicy : "none",
+                fw.fsrfgLastReuseFramePose ? "Y" : "N");
+            if (fw.xefgPresentStatusSeen)
+            {
+                ImGui::Text("XeFG: #%llu frames=%u enabled=%s fgResult=%d query=%d",
+                    fw.xefgPresentStatusCount,
+                    fw.xefgLastFramesPresented,
+                    fw.xefgLastFrameGenEnabled ? "Y" : "N",
+                    fw.xefgLastFrameGenResult,
+                    fw.xefgLastPresentStatusResult);
+                ImGui::Text("XeFG final: present=%llu sync=%llu async=%llu warp=%llu/%llu skip=%llu last=%s",
+                    fw.xefgFinalPresentCount,
+                    fw.xefgFinalPresentInternalCount,
+                    fw.xefgFinalPresentAsyncCount,
+                    fw.xefgFinalWarpAppliedCount,
+                    fw.xefgFinalWarpAttemptCount,
+                    fw.xefgFinalWarpSkippedCount,
+                    fw.xefgFinalPresentLastInternal ? "sync" : "async");
+            }
+            ImGui::Text("UI: %s age=%llu clean=%s repair=%s warpMask=%s",
+                fw.lastStableUiSource[0] ? fw.lastStableUiSource : "none",
+                fw.lastStableUiAge,
+                fw.lastStableUiCleanSceneValid ? "Y" : "N",
+                fw.lastStableUiRepairSource[0] ? fw.lastStableUiRepairSource : "none",
+                fw.lastStableUiUseWarpTransform ? "Y" : "N");
+            ImGui::Text("Raw Input: %s", fw.rawInputSeen ? "Yes" : "No");
+            ImGui::Text("Raw Msg/Fwd/Sample: %llu / %llu / %llu",
+                fw.rawInputMessageCount, fw.rawInputForwardedCount, fw.rawInputSampleCount);
+            ImGui::Text("Raw Hz/SinceSnap/Pred: %.0f / %u / %s",
+                fw.rawInputSampleHz,
+                fw.rawInputSamplesSinceSnapshot,
+                fw.lastInputPredictionApplied ? "Y" : "N");
+            ImGui::Text("Raw Source: %s", fw.lastRawInputSource[0] ? fw.lastRawInputSource : "none");
+            ImGui::Text("Raw Active: %s", fw.activeRawInputSource[0] ? fw.activeRawInputSource : "none");
+            ImGui::Text("Raw Delta: %ld, %ld", fw.lastRawInputDx, fw.lastRawInputDy);
+            ImGui::Text("Raw Interval ms: %.3f avg %.3f sd %.3f max %.3f",
+                fw.rawInputIntervalMinMs,
+                fw.rawInputIntervalMeanMs,
+                fw.rawInputIntervalStdDevMs,
+                fw.rawInputIntervalMaxMs);
+            ImGui::Text("Snapshot/Input Age: %.3f / %.3f ms",
+                fw.lastSnapshotAgeMs,
+                fw.lastInputSampleAgeMs);
+            ImGui::Text("Mouse dx/dy: %.1f, %.1f  pred: %.2f, %.2f",
+                fw.lastFinalMouseDeltaDx, fw.lastFinalMouseDeltaDy,
+                fw.lastPredictedMouseDx, fw.lastPredictedMouseDy);
+            ImGui::Text("Mouse step dx/dy: %.1f, %.1f",
+                fw.lastFinalMouseDeltaStepDx, fw.lastFinalMouseDeltaStepDy);
+            ImGui::Text("Raw Drop/Dup/Ignore/Inactive: %llu / %llu / %llu / %llu",
+                fw.rawInputDroppedNoCallbackCount, fw.rawInputDuplicateCount, fw.rawInputIgnoredCount,
+                fw.rawInputInactiveSourceCount);
+            ImGui::Text("Raw Src Msg D/B/Sub: %llu / %llu / %llu",
+                fw.rawInputDataMessageCount, fw.rawInputBufferMessageCount, fw.rawInputSubclassMessageCount);
+            ImGui::Text("Raw Src Fwd D/B/Sub: %llu / %llu / %llu",
+                fw.rawInputDataForwardedCount, fw.rawInputBufferForwardedCount, fw.rawInputSubclassForwardedCount);
+            ImGui::Text("Hooks D/B/Sub: %s / %s / %s",
+                fw.rawInputDataHookSeen ? "Y" : "N",
+                fw.rawInputBufferHookSeen ? "Y" : "N",
+                fw.rawInputSubclassSeen ? "Y" : "N");
+            ImGui::Text("FSRFG interval ms: %.3f avg %.3f sd %.3f",
+                fw.fsrfgPresentIntervalMs,
+                fw.fsrfgPresentIntervalMeanMs,
+                fw.fsrfgPresentIntervalStdDevMs);
+            ImGui::Text("Yaw: %.4f  Pitch: %.4f", fw.lastDeltaYaw, fw.lastDeltaPitch);
+            ImGui::Text("Pose jitter: %.5f, %.5f  Clamp: %s",
+                fw.lastPoseJitterYaw, fw.lastPoseJitterPitch,
+                fw.lastPoseClampApplied ? "Y" : "N");
+            ImGui::Text("FOV: %.1f deg  Aspect: %.3f (%s)",
+                fw.lastVFovRadians * 57.29578f,
+                fw.lastAspectRatio,
+                fw.lastFovSource[0] ? fw.lastFovSource : "unknown");
+            ImGui::Text("Calibration: %s  Shift: %.1f px  Edge: %.1f px",
+                fw.lastCalibrationSource[0] ? fw.lastCalibrationSource : "unknown",
+                fw.lastApproxPixelShift,
+                fw.lastDisocclusionPixels);
+
+            // Magnitude bar
+            float magnitude = fabsf(fw.lastDeltaYaw) + fabsf(fw.lastDeltaPitch);
+            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.4f, 0.7f, 1.0f, 1.0f));
+            ImGui::ProgressBar(std::min(magnitude / 0.1f, 1.0f), ImVec2(-1, 0), "");
+            ImGui::PopStyleColor();
+
+            if (fw.lastSkipReason[0] != '\0')
+            {
+                ImVec4 skipColor = ImVec4(1.0f, 0.8f, 0.2f, 1.0f);
+                ImGui::TextColored(skipColor, "Skip: %s", fw.lastSkipReason);
+            }
+
+            ImGui::Text("Manual rad/count: %.5f  Str: %.1f",
+                Config::Instance()->FrameWarpSensitivity.value_or_default(),
+                Config::Instance()->FrameWarpStrength.value_or_default());
+        }
+        ImGui::End();
     }
+
+    // ---- Frame Warp Debug Mask View ----
+    // Full-screen displacement mask visualization
+    if (State::Instance().frameWarpDebugOverlay && State::Instance().frameWarpStatus.available)
+    {
+        auto debugViewMode = Config::Instance()->FrameWarpDebugViewMode.value_or_default();
+        if (debugViewMode >= Config::FrameWarpDebugView_Mask && State::Instance().frameWarpDebugMaskReady)
+        {
+            auto* maskResource = State::Instance().frameWarpDebugMaskResource;
+            auto* srvHeap = MenuOverlayDx::GetSrvDescriptorHeap();
+            auto* device = State::Instance().currentD3D12Device;
+
+            // Deferred-free ring buffer for SRV descriptors.
+            // We can't free the descriptor immediately because the GPU may still
+            // be reading from it. Instead, we queue it and free it when the
+            // oldest entry is guaranteed to be no longer in use (after
+            // FW_MASK_DESC_RING_SIZE frames). This matches the swapchain
+            // backbuffer count and ensures the GPU has finished with the descriptor.
+            static constexpr int FW_MASK_DESC_RING_SIZE = 8;
+            static int fwMaskDescRingIndex = 0;
+            static bool fwMaskDescRingValid[FW_MASK_DESC_RING_SIZE] = {};
+            static D3D12_CPU_DESCRIPTOR_HANDLE fwMaskDescRingCpu[FW_MASK_DESC_RING_SIZE] = {};
+            static D3D12_GPU_DESCRIPTOR_HANDLE fwMaskDescRingGpu[FW_MASK_DESC_RING_SIZE] = {};
+
+            // Free the oldest descriptor (if any) before allocating a new one
+            if (fwMaskDescRingValid[fwMaskDescRingIndex])
+            {
+                MenuOverlayDx::FreeSrvDescriptor(fwMaskDescRingCpu[fwMaskDescRingIndex], fwMaskDescRingGpu[fwMaskDescRingIndex]);
+                fwMaskDescRingValid[fwMaskDescRingIndex] = false;
+            }
+
+            if (maskResource != nullptr && srvHeap != nullptr && device != nullptr)
+            {
+                // Allocate an SRV descriptor for the mask texture
+                D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle {};
+                D3D12_GPU_DESCRIPTOR_HANDLE gpuHandle {};
+                if (MenuOverlayDx::AllocateSrvDescriptor(&cpuHandle, &gpuHandle))
+                {
+                    // Create SRV for the debug mask texture
+                    D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+                    srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                    auto desc = maskResource->GetDesc();
+                    srvDesc.Format = desc.Format;
+                    srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                    srvDesc.Texture2D.MipLevels = 1;
+                    device->CreateShaderResourceView(maskResource, &srvDesc, cpuHandle);
+
+                    // Render as full-screen image overlay
+                    ImGui::SetNextWindowPos(ImVec2(0, 0));
+                    ImGui::SetNextWindowSize(io.DisplaySize);
+                    ImGui::SetNextWindowBgAlpha(0.7f);
+                    ImGui::Begin("##FrameWarpDebugMask", nullptr,
+                        ImGuiWindowFlags_NoSavedSettings |
+                        ImGuiWindowFlags_NoFocusOnAppearing |
+                        ImGuiWindowFlags_NoNav |
+                        ImGuiWindowFlags_NoDecoration |
+                        ImGuiWindowFlags_NoInputs |
+                        ImGuiWindowFlags_NoBringToFrontOnFocus);
+
+                    // Semi-transparent overlay so game is visible underneath
+                    ImGui::Image((ImTextureID)(uintptr_t)gpuHandle.ptr, io.DisplaySize);
+
+                    ImGui::End();
+
+                    // Queue the descriptor for deferred free (will be freed after
+                    // FW_MASK_DESC_RING_SIZE frames when this slot comes around again)
+                    fwMaskDescRingCpu[fwMaskDescRingIndex] = cpuHandle;
+                    fwMaskDescRingGpu[fwMaskDescRingIndex] = gpuHandle;
+                    fwMaskDescRingValid[fwMaskDescRingIndex] = true;
+                    fwMaskDescRingIndex = (fwMaskDescRingIndex + 1) % FW_MASK_DESC_RING_SIZE;
+                }
+            }
+            }
+        }
 
     if (_isVisible)
     {
@@ -3511,7 +4243,8 @@ bool MenuCommon::RenderMenu()
 
                 // OptiFG requirements
                 auto constexpr optiFgIndex = (uint32_t) FGInput::Upscaler;
-                inputOptions[optiFgIndex].set_disabled(state.api == API::DX11 || state.api == API::Vulkan,
+                inputOptions[optiFgIndex].set_disabled((state.api == API::DX11 && !state.dx11FGMode) ||
+                                                           state.api == API::Vulkan,
                                                        "Unsupported API");
                 inputOptions[optiFgIndex].set_disabled(state.workingMode == WorkingMode::Nvngx,
                                                        "Unsupported Opti working mode");
@@ -3531,6 +4264,13 @@ bool MenuCommon::RenderMenu()
                     XeFGProxy::InitXeFG();
                     inputOptions[optiFgIndex].set_disabled(XeFGProxy::Module() == nullptr, "libxess_fg.dll is missing");
                 }
+                else if (!inputOptions[optiFgIndex].disabled && state.activeFgOutput == FGOutput::DLSSG &&
+                         !SLProxy::IsReady())
+                {
+                    SLProxy::InitSL();
+                    inputOptions[optiFgIndex].set_disabled(!SLProxy::IsReady(),
+                                                           "sl/ subfolder with Streamline DLLs is missing");
+                }
 
                 // DLSSG inputs requirements
                 auto constexpr dlssgInputIndex = (uint32_t) FGInput::DLSSG;
@@ -3545,11 +4285,13 @@ bool MenuCommon::RenderMenu()
 
                 // FSRFG inputs requirements
                 auto constexpr fsrfgInputIndex = (uint32_t) FGInput::FSRFG;
-                inputOptions[fsrfgInputIndex].set_disabled(state.swapchainApi != API::DX12, "Unsupported API");
+                inputOptions[fsrfgInputIndex].set_disabled(state.swapchainApi != API::DX12 && !state.dx11FGMode,
+                                                           "Unsupported API");
 
                 // FSRFG30 inputs requirements
                 auto constexpr fsrfg30InputIndex = (uint32_t) FGInput::FSRFG30;
-                inputOptions[fsrfg30InputIndex].set_disabled(state.swapchainApi != API::DX12, "Unsupported API");
+                inputOptions[fsrfg30InputIndex].set_disabled(state.swapchainApi != API::DX12 && !state.dx11FGMode,
+                                                             "Unsupported API");
 
                 if (!config->FGInput.has_value())
                     config->FGInput = config->FGInput.value_or_default(); // need to have a value before combo
@@ -3565,7 +4307,8 @@ bool MenuCommon::RenderMenu()
                     { FGOutput::NoFG, "No Frame Generation" },
                     { FGOutput::Nukems, "FSR3-FG via Nukem's", "Enable DLSS-FG in-game" },
                     { FGOutput::FSRFG, "FSR FG", "FSR3/4 FG" },
-                    { FGOutput::DLSSG, "DLSSG", "Support not implemented" },
+                    { FGOutput::DLSSG, "DLSSG",
+                        "DLSS Frame Generation\nRequires sl/ subfolder with Streamline DLLs\nSupports MFG on RTX 50 series" },
                     { FGOutput::XeFG, "XeFG", "XeFG" }
                 };
 
@@ -3573,8 +4316,6 @@ bool MenuCommon::RenderMenu()
 
                 // DLSSG output requirements
                 auto constexpr dlssgOutputIndex = (uint32_t) FGOutput::DLSSG;
-                outputOptions[dlssgOutputIndex].set_disabled(true, "Support not implemented");
-
                 // Nukem's FG mod requirements
                 auto constexpr nukemsInputIndex = (uint32_t) FGInput::Nukems;
                 auto constexpr nukemsOutputIndex = (uint32_t) FGOutput::Nukems;
@@ -3591,13 +4332,21 @@ bool MenuCommon::RenderMenu()
                                                                   "Missing the dlssg_to_fsr3_amd_is_better.dll file");
                 }
 
-                // FSR FG output requirements
+                // FSR FG / XeFG / DLSS-G output requirements
                 auto constexpr fsrfgOutputIndex = (uint32_t) FGOutput::FSRFG;
-                outputOptions[fsrfgOutputIndex].set_disabled(state.swapchainApi != API::DX12, "Unsupported API");
-
-                // XeFG output requirements
                 auto constexpr xefgOutputIndex = (uint32_t) FGOutput::XeFG;
-                outputOptions[xefgOutputIndex].set_disabled(state.swapchainApi != API::DX12, "Unsupported API");
+                const bool unsupportedFgOutputApi = state.swapchainApi != API::DX12 && !state.dx11FGMode;
+                outputOptions[fsrfgOutputIndex].set_disabled(unsupportedFgOutputApi, "Unsupported API");
+                outputOptions[xefgOutputIndex].set_disabled(unsupportedFgOutputApi, "Unsupported API");
+                outputOptions[dlssgOutputIndex].set_disabled(unsupportedFgOutputApi, "Unsupported API");
+                const bool streamlineFilesAvailable = StreamlineFilesAvailableForSelection();
+                const bool nativeDlssgCanUseGameStreamline =
+                    config->FGDLSSGNativeMode.value_or_default() == DLSSGNativeMode::Attach ||
+                    config->FGDLSSGNativeMode.value_or_default() == DLSSGNativeMode::Passthrough ||
+                    (config->FGDLSSGNativeMode.value_or_default() == DLSSGNativeMode::Auto &&
+                     state.dlssgNativeStreamlineDetected);
+                outputOptions[dlssgOutputIndex].set_disabled(!streamlineFilesAvailable && !nativeDlssgCanUseGameStreamline,
+                                                             "Missing sl/ subfolder with Streamline DLLs");
 
                 // Unsupported FG input selected
                 if (config->FGInput != FGInput::NoFG && inputOptions[(uint32_t) state.activeFgInput].disabled &&
@@ -3668,8 +4417,27 @@ bool MenuCommon::RenderMenu()
                         ImGui::Spacing();
                     }
 
+                    if (config->FGOutput.value_or_default() == FGOutput::DLSSG)
+                    {
+                        const char* nativeModeNames[] = { "Auto", "Legacy", "Attach", "Passthrough" };
+                        int nativeMode = static_cast<int>(config->FGDLSSGNativeMode.value_or_default());
+                        nativeMode = std::clamp(nativeMode, 0, (int)IM_ARRAYSIZE(nativeModeNames) - 1);
+                        ImGui::PushItemWidth(160.0f * config->MenuScale.value_or(1.0f));
+                        if (ImGui::Combo("DLSSG Native Mode", &nativeMode, nativeModeNames,
+                                         IM_ARRAYSIZE(nativeModeNames)))
+                        {
+                            config->FGDLSSGNativeMode = static_cast<DLSSGNativeMode>(nativeMode);
+                        }
+                        ImGui::PopItemWidth();
+                        ShowHelpMarker("Auto attaches to game-native Streamline when detected\n"
+                                       "Legacy uses OptiScaler-owned DLSSG output\n"
+                                       "Attach observes native Streamline for Frame Warp\n"
+                                       "Passthrough leaves native DLSSG untouched");
+                    }
+
                     auto fgOutput = reinterpret_cast<IFGFeature_Dx12*>(state.currentFG);
-                    if (((state.activeFgOutput == FGOutput::FSRFG || state.activeFgOutput == FGOutput::XeFG) &&
+                    if (((state.activeFgOutput == FGOutput::FSRFG || state.activeFgOutput == FGOutput::XeFG ||
+                          state.activeFgOutput == FGOutput::DLSSG) &&
                          state.activeFgInput != FGInput::NoFG && state.activeFgInput != FGInput::Nukems) &&
                         fgOutput)
                     {
@@ -4311,6 +5079,65 @@ bool MenuCommon::RenderMenu()
                     }
                 }
 
+                // DLSS-G controls
+                if (state.activeFgOutput == FGOutput::DLSSG && state.activeFgInput != FGInput::NoFG &&
+                    state.workingMode != WorkingMode::Nvngx && state.currentFGSwapchain != nullptr)
+                {
+                    if (SLProxy::IsReady() && currentFeature != nullptr && !currentFeature->IsFrozen())
+                    {
+                        ImGui::SeparatorText("Frame Generation (DLSS-G)");
+
+                        bool fgActive = config->FGEnabled.value_or_default();
+                        if (ImGui::Checkbox("Active##4", &fgActive))
+                        {
+                            config->FGEnabled = fgActive;
+                            LOG_DEBUG("Enabled set FGEnabled (DLSSG): {}", fgActive);
+                            state.FGchanged = true;
+                        }
+                        ShowHelpMarker("Enable DLSS Frame Generation");
+
+                        // MFG dropdown - only show if hardware supports it
+                        if (state.DLSSGMaxFramesToGenerate > 1)
+                        {
+                            ImGui::SameLine(0.0f, 16.0f);
+
+                            const char* mfgModes[] = { "2X", "3X", "4X" };
+                            auto currentSet = config->FGDLSSGInterpolationCount.value_or_default() - 1;
+                            if (currentSet < 0) currentSet = 0;
+                            if (currentSet > 2) currentSet = 2;
+                            auto currentMode = mfgModes[currentSet];
+
+                            ImGui::PushItemWidth(95.0f * config->MenuScale.value_or(1.0f));
+
+                            if (ImGui::BeginCombo("MFG##dlssg", currentMode))
+                            {
+                                for (uint32_t i = 0; i < state.DLSSGMaxFramesToGenerate && i < 3; i++)
+                                {
+                                    if (ImGui::Selectable(mfgModes[i], (currentSet == (int) i)))
+                                    {
+                                        LOG_DEBUG("DLSS-G Interpolation Count set to: {}", i + 1);
+                                        config->FGDLSSGInterpolationCount = (int) i + 1;
+
+                                        auto fgOutput = reinterpret_cast<IFGFeature_Dx12*>(state.currentFG);
+                                        if (fgOutput != nullptr)
+                                            fgOutput->SetInterpolatedFrameCount(i + 1);
+                                    }
+                                }
+
+                                ImGui::EndCombo();
+                            }
+
+                            ImGui::PopItemWidth();
+                            ShowHelpMarker("DLSS Multi Frame Generation\n"
+                                           "2X = 1 generated frame\n"
+                                           "3X = 2 generated frames\n"
+                                           "4X = 3 generated frames\n\n"
+                                           "Requires RTX 50 series GPU");
+                        }
+
+                    }
+                }
+
                 // OptiFG
                 if (state.api == DX12 && state.currentFGSwapchain != nullptr &&
                     state.workingMode != WorkingMode::Nvngx && state.activeFgInput == FGInput::Upscaler)
@@ -4319,7 +5146,8 @@ bool MenuCommon::RenderMenu()
 
                     if (currentFeature != nullptr && !currentFeature->IsFrozen() &&
                         ((state.activeFgOutput == FGOutput::FSRFG && FfxApiProxy::IsFGReady()) ||
-                         (state.activeFgOutput == FGOutput::XeFG && XeFGProxy::Module() != nullptr)))
+                         (state.activeFgOutput == FGOutput::XeFG && XeFGProxy::Module() != nullptr) ||
+                         (state.activeFgOutput == FGOutput::DLSSG && SLProxy::IsReady())))
                     {
                         if (!Config::Instance()->FGDisableHUDFix.value_or_default())
                         {
@@ -4606,6 +5434,21 @@ bool MenuCommon::RenderMenu()
                         ImGui::TextColored({ 1.0f, 0.0f, 0.0f, 1.0f },
                                            "libxess_fg.dll is missing!"); // Probably never will be visible
                     }
+                    else if (state.activeFgOutput == FGOutput::DLSSG && !SLProxy::IsReady())
+                    {
+                        if (DLSSGNative::IsAttachActive())
+                            ImGui::TextColored({ 0.4f, 1.0f, 0.4f, 1.0f },
+                                               "Using game-native DLSSG attach mode");
+                        else if (DLSSGNative::IsPassthroughActive())
+                            ImGui::TextColored({ 0.4f, 1.0f, 0.4f, 1.0f },
+                                               "Using game-native DLSSG passthrough");
+                        else if (StreamlineFilesAvailableForSelection())
+                            ImGui::TextColored({ 1.0f, 0.8f, 0.0f, 1.0f },
+                                               "Save INI and restart to initialize DLSSG");
+                        else
+                            ImGui::TextColored({ 1.0f, 0.0f, 0.0f, 1.0f },
+                                               "sl/ subfolder with Streamline DLLs is missing!");
+                    }
                 }
 
                 // Nukems Mod
@@ -4848,21 +5691,44 @@ bool MenuCommon::RenderMenu()
                 {
                     SeparatorWithHelpMarker(
                         "Framerate",
-                        "Uses Reflex when possible\nOn AMD/Intel cards, you can use Fakenvapi to substitute Reflex");
+                        "Choose latency reduction method and set FPS cap");
 
+                    // Latency method dropdown
+                    {
+                        static const std::vector<MenuOption<uint32_t>> latencyMethods = {
+                            { 0, "Auto", "Auto-detect best method for your GPU" },
+                            { 1, "Reflex", "NVIDIA Reflex (NVIDIA GPUs)" },
+                            { 2, "Anti-Lag 2", "AMD Anti-Lag 2 (AMD GPUs)" },
+                            { 3, "XeLL", "Intel Xe Low Latency (Intel GPUs, DX12)" },
+                            { 4, "LatencyFlex", "LatencyFlex via fakenvapi (cross-vendor)" },
+                            { 5, "Off", "Disable latency reduction" }
+                        };
+
+                        PopulateCombo("Latency Method", config->LatencyReductionMethod, latencyMethods);
+                    }
+
+                    // Show active method status
                     static std::string currentMethod {};
-                    if (state.reflexLimitsFps)
+                    if (NativeLowLatency::IsAvailable())
+                    {
+                        auto backend = NativeLowLatency::GetBackend();
+                        if (backend == NativeLatencyBackend::AntiLag2)
+                            currentMethod = "Anti-Lag 2 (Native)";
+                        else if (backend == NativeLatencyBackend::XeLL)
+                            currentMethod = "XeLL (Native)";
+                    }
+                    else if (state.reflexLimitsFps)
                     {
                         if (fakenvapi::updateModeAndContext())
                         {
                             auto mode = fakenvapi::getCurrentMode();
 
                             if (mode == Mode::AntiLag2)
-                                currentMethod = "AntiLag 2";
+                                currentMethod = "AntiLag 2 (fakenvapi)";
                             else if (mode == Mode::LatencyFlex)
                                 currentMethod = "LatencyFlex";
                             else if (mode == Mode::XeLL)
-                                currentMethod = "XeLL";
+                                currentMethod = "XeLL (fakenvapi)";
                             else if (mode == Mode::AntiLagVk)
                                 currentMethod = "Vulkan AntiLag";
 
@@ -4885,7 +5751,7 @@ bool MenuCommon::RenderMenu()
                     if (state.rtssReflexInjection)
                         currentMethod.append(" (RTSS)");
 
-                    ImGui::Text("Current method: %s", currentMethod.c_str());
+                    ImGui::Text("Active: %s", currentMethod.c_str());
 
                     if (state.reflexShowWarning)
                     {
@@ -4925,12 +5791,17 @@ bool MenuCommon::RenderMenu()
                         ImGui::PopItemWidth();
 
                         float refreshRateF = static_cast<float>(refreshRate);
-                        // it's fine to use with real reflex, we only care about antilag
-                        auto fpsLimitTech = fakenvapi::getCurrentMode();
+                        // Anti-Lag 2 uses integer FPS, so round for it
+                        bool isAntiLag2 = NativeLowLatency::GetBackend() == NativeLatencyBackend::AntiLag2;
+                        if (!isAntiLag2)
+                        {
+                            auto fpsLimitTech = fakenvapi::getCurrentMode();
+                            isAntiLag2 = (fpsLimitTech == Mode::AntiLag2 || fpsLimitTech == Mode::AntiLagVk);
+                        }
                         constexpr float margin = 0.3f; // in ms
                         float frameCap = std::round(10000.f / (1000.f / refreshRateF + margin)) / 10.f;
 
-                        if (fpsLimitTech == Mode::AntiLag2 || fpsLimitTech == Mode::AntiLagVk)
+                        if (isAntiLag2)
                             frameCap = std::round(frameCap);
 
                         ImGui::Text("Calculated Cap: %.1f", frameCap);
@@ -4944,6 +5815,376 @@ bool MenuCommon::RenderMenu()
                         }
                     }
                 }
+    // FRAME WARP ---------------------------
+    {
+        ImGui::SeparatorText("VibeFlex 2");
+        if (bool fwEnabled = config->FrameWarpEnabled.value_or_default(); ImGui::Checkbox("Enable VibeFlex 2", &fwEnabled))
+            {
+                config->FrameWarpEnabled = fwEnabled;
+                // Enabled state synced from config each frame in FG_Hooks
+            }
+        ShowHelpMarker("Applies a mouse-driven warp to reduce input latency\n"
+                    "Uses actual mouse input received during rendering to shift the frame\n"
+                    "v1: standalone DX12 warp plus FSRFG present-callback warp\n"
+                    "XeFG: proxy input-frame warp before Present\n"
+                    "Requires raw mouse input");
+
+        if (config->FrameWarpEnabled.value_or_default())
+        {
+            ScopedIndent indent {};
+
+            if (bool fwWithFG = config->FrameWarpWithFG.value_or_default(); ImGui::Checkbox("Allow with FG", &fwWithFG))
+                config->FrameWarpWithFG = fwWithFG;
+            ShowHelpMarker("Enable VibeFlex 2 when Frame Generation is active\n"
+                    "FSRFG uses a generated-frame present callback\n"
+                    "XeFG warps the proxy input frame before XeFG interpolation\n"
+                    "DLSSG can use comparison telemetry, a distortion-field probe, or VibeFlex 2");
+
+            const char* dlssgModeNames[] = {
+                "Off",
+                "Telemetry only",
+                "Distortion field",
+                "VibeFlex 2",
+                "Resource copy warp",
+            };
+            int dlssgMode = (int)std::min<uint32_t>(config->FrameWarpDLSSGMode.value_or_default(), 4);
+            ImGui::PushItemWidth(135.0f * menuResScale);
+            if (ImGui::Combo("VibeFlex 2 path", &dlssgMode, dlssgModeNames, IM_ARRAYSIZE(dlssgModeNames)))
+                config->FrameWarpDLSSGMode = (uint32_t)dlssgMode;
+            ImGui::PopItemWidth();
+            ShowHelpMarker("Controls the DLSSG VibeFlex 2 path\n"
+                "Distortion field tags a Streamline bidirectional distortion texture before DLSSG dispatch\n"
+                "VibeFlex 2 modifies the DLSSG/native-DLSSG backbuffer immediately before Present\n"
+                "Resource copy warp experimentally corrects the detected sl.common full-resolution copy target\n"
+                "The DLSSG safe policy prioritizes smoothness over latency benefit until phase-aware correction exists");
+
+            const bool showFrameWarpDiagnostics =
+                config->FrameWarpDebug.value_or_default() ||
+                config->FrameWarpTimingAuditLog.value_or_default() ||
+                config->FrameWarpDLSSGPhaseMode.value_or_default() != 0 ||
+                config->FrameWarpDLSSGUnsafeLiveWarp.value_or_default() ||
+                config->FrameWarpFGDiagnosticMode.value_or_default() != 0;
+
+            if (!showFrameWarpDiagnostics)
+            {
+                ImGui::TextDisabled("Developer diagnostics hidden");
+                ShowHelpMarker("Normal use only needs the VibeFlex 2 path above\n"
+                    "Enable Debug Overlay or TimingAuditLog, or set a diagnostic value in the INI, to show raw DLSSG phase/unsafe controls");
+            }
+
+            if (showFrameWarpDiagnostics)
+            {
+            const char* dlssgPhaseModeNames[] = {
+                "Safe default",
+                "Snapshot changed",
+                "Snapshot unchanged",
+                "Every other present",
+                "SL generated heuristic",
+            };
+            int dlssgPhaseMode =
+                (int)std::min<uint32_t>(config->FrameWarpDLSSGPhaseMode.value_or_default(), 4);
+            ImGui::PushItemWidth(160.0f * menuResScale);
+            if (ImGui::Combo("DLSSG phase test", &dlssgPhaseMode, dlssgPhaseModeNames, IM_ARRAYSIZE(dlssgPhaseModeNames)))
+                config->FrameWarpDLSSGPhaseMode = (uint32_t)dlssgPhaseMode;
+            ImGui::PopItemWidth();
+            ShowHelpMarker("Diagnostic-only live-warp phase gate for DLSSG late-present mode\n"
+                "Safe default suppresses DLSSG live warp until reliable generated-output phase awareness exists\n"
+                "Snapshot unchanged is a protective proof gate, not the quality fix\n"
+                "Does not affect no-submit or identity-submit test modes\n"
+                "Use it to prove whether VibeFlex 2 is warping the wrong DLSSG output phase");
+
+            bool dlssgUnsafeLiveWarp = config->FrameWarpDLSSGUnsafeLiveWarp.value_or_default();
+            if (ImGui::Checkbox("DLSSG raw live warp", &dlssgUnsafeLiveWarp))
+                config->FrameWarpDLSSGUnsafeLiveWarp = dlssgUnsafeLiveWarp;
+            ShowHelpMarker("Diagnostic/experimental only\n"
+                "Restores raw live DLSSG late-present warp behavior\n"
+                "Known to reproduce jitter in KCD2; leave off for smooth default behavior");
+            }
+
+            if (bool fwDebug = config->FrameWarpDebug.value_or_default(); ImGui::Checkbox("Debug Overlay", &fwDebug))
+            {
+                config->FrameWarpDebug = fwDebug;
+                State::Instance().frameWarpDebugOverlay = fwDebug;
+                // If turning on debug, default to overlay mode if off
+                if (fwDebug && config->FrameWarpDebugViewMode.value_or_default() == Config::FrameWarpDebugView_Off)
+                    config->FrameWarpDebugViewMode = Config::FrameWarpDebugView_Overlay;
+                else if (!fwDebug)
+                    config->FrameWarpDebugViewMode = Config::FrameWarpDebugView_Off;
+            }
+            const char* debugViewNames[] = { "Off", "Overlay", "Mask" };
+            int debugViewMode = (int)config->FrameWarpDebugViewMode.value_or_default();
+            ImGui::PushItemWidth(95.0f * menuResScale);
+            if (ImGui::Combo("View", &debugViewMode, debugViewNames, IM_ARRAYSIZE(debugViewNames)))
+            {
+                config->FrameWarpDebugViewMode = (uint32_t)debugViewMode;
+                State::Instance().frameWarpDebugOverlay = (debugViewMode >= Config::FrameWarpDebugView_Overlay);
+                config->FrameWarpDebug = State::Instance().frameWarpDebugOverlay;
+            }
+            ImGui::PopItemWidth();
+            ShowHelpMarker("Show warp diagnostics\nOverlay: text with yaw/pitch/skip reason\nMask: full-screen displacement visualization (R=horiz, G=vert, B=disocclusion)");
+
+            if (showFrameWarpDiagnostics)
+            {
+            const char* fgDiagNames[] = {
+                "Normal (warp all)",
+                "Copy both",
+                "Warp all latched",
+                "Warp all latched",
+                "Warp all latched",
+                "Warp all latched"
+            };
+            int fgDiagMode = (int)config->FrameWarpFGDiagnosticMode.value_or_default();
+            fgDiagMode = std::clamp(fgDiagMode, 0, (int)IM_ARRAYSIZE(fgDiagNames) - 1);
+            ImGui::PushItemWidth(135.0f * menuResScale);
+            if (ImGui::Combo("FG diagnostic", &fgDiagMode, fgDiagNames, IM_ARRAYSIZE(fgDiagNames)))
+                config->FrameWarpFGDiagnosticMode = (uint32_t)fgDiagMode;
+            ImGui::PopItemWidth();
+            ShowHelpMarker("FSRFG cadence diagnostics\n"
+                "Normal warps every displayed callback with one pose per frame ID\n"
+                "Copy both copies all callbacks for baseline testing");
+            }
+
+            float fwStrength = config->FrameWarpStrength.value_or_default();
+            if (ImGui::SliderFloat("Warp Strength", &fwStrength, 0.0f, 1.0f, "%.2f"))
+            {
+                config->FrameWarpStrength = fwStrength;
+                // Warp strength synced from config each frame in FG_Hooks
+            }
+            ShowHelpMarker("How much of the predicted camera change to apply\n"
+                "1.0 = full configured warp, 0.5 = half");
+
+            bool fwAutoCalibration = config->FrameWarpAutoCalibration.value_or_default();
+            if (ImGui::Checkbox("Auto mouse calibration", &fwAutoCalibration))
+                config->FrameWarpAutoCalibration = fwAutoCalibration;
+            ShowHelpMarker("Uses camera/FOV data for diagnostics and future automatic mouse calibration\n"
+                "When camera delta is unavailable, Frame Warp reports and uses the manual fallback");
+
+            bool fwInputPrediction = config->FrameWarpInputPrediction.value_or_default();
+            if (ImGui::Checkbox("Input prediction", &fwInputPrediction))
+                config->FrameWarpInputPrediction = fwInputPrediction;
+            ShowHelpMarker("Predicts raw mouse movement up to 2 ms beyond the newest sample when recent input is fresh and directionally consistent");
+
+            const char* rawInputSourceModes[] = {
+                "Auto",
+                "GetRawInputData only",
+                "GetRawInputBuffer only",
+                "Subclass only",
+            };
+            int fwRawInputSourceMode =
+                static_cast<int>(std::min<uint32_t>(config->FrameWarpRawInputSourceMode.value_or_default(), 3));
+            ImGui::PushItemWidth(145.0f * menuResScale);
+            if (ImGui::Combo("Raw input source", &fwRawInputSourceMode, rawInputSourceModes, IM_ARRAYSIZE(rawInputSourceModes)))
+                config->FrameWarpRawInputSourceMode = static_cast<uint32_t>(fwRawInputSourceMode);
+            ImGui::PopItemWidth();
+            ShowHelpMarker("Selects one authoritative raw-input capture path\n"
+                "Auto prefers buffered input, then GetRawInputData, then subclassed WM_INPUT");
+
+            float fwSensitivity = config->FrameWarpSensitivity.value_or_default();
+            if (ImGui::SliderFloat("Manual rad/count", &fwSensitivity, 0.00005f, 0.005f, "%.5f"))
+            {
+                config->FrameWarpSensitivity = fwSensitivity;
+                // Sync sensitivity immediately via callback (not frame-synced like other params)
+                if (State::Instance().frameWarpRawMouseCallback)
+                {
+                    // Sensitivity is applied in MouseTracker, which is accessed via FG_Hooks
+                    // For now, sensitivity is read from config each frame in the warp path
+                }
+            }
+            ShowHelpMarker("Converts raw mouse counts to estimated camera rotation radians\n"
+                "Used only as the fallback when automatic calibration cannot derive a camera delta\n"
+                "Too low = warp barely moves; too high = warp overshoots\n"
+                "0.0005 is the conservative default");
+
+            float fwMaxAngle = config->FrameWarpMaxAngle.value_or_default();
+            if (ImGui::SliderFloat("Max Warp Angle", &fwMaxAngle, 0.1f, 180.0f, "%.1f deg"))
+            {
+                config->FrameWarpMaxAngle = fwMaxAngle;
+                // Max warp angle synced from config each frame in FG_Hooks
+            }
+            ShowHelpMarker("Maximum camera rotation the warp will apply\n"
+                "Higher values increase VibeFlex 2 impact during fast turns but can reveal severe distortion\n"
+                "Very high values are experimental stress settings, not recommended defaults");
+
+            bool fwDepthAware = config->FrameWarpDepthAware.value_or_default();
+            if (ImGui::Checkbox("Depth Infill", &fwDepthAware))
+                config->FrameWarpDepthAware = fwDepthAware;
+            ShowHelpMarker("Uses the captured depth buffer to detect foreground edges and disocclusion confidence\n"
+                "VibeFlex 2 keeps the main mouse warp rotation-based and uses depth for infill around holes and silhouettes\n"
+                "If a safe private depth copy is unavailable, VibeFlex 2 falls back to color-only and logs the reason");
+
+            // Debug overlay info
+            if (config->FrameWarpDebug.value_or_default())
+            {
+                ImGui::Spacing();
+                if (ImGui::TreeNodeEx("VibeFlex 2 Diagnostics"))
+                {
+                ImGui::Text("  Available: %s", State::Instance().frameWarpStatus.available ? "Yes" : "No");
+                ImGui::Text("  Active: %s", State::Instance().frameWarpStatus.lastWarpApplied ? "Yes" : "No");
+                ImGui::Text("  Applied: %s", State::Instance().frameWarpStatus.lastWarpApplied ? "Yes" : "No");
+                ImGui::TextWrapped("  Owner: %s (%s)",
+                    State::Instance().frameWarpStatus.lastPresentationOwnerName[0]
+                        ? State::Instance().frameWarpStatus.lastPresentationOwnerName
+                        : "unknown",
+                    State::Instance().frameWarpStatus.lastPresentationOwnerReason[0]
+                        ? State::Instance().frameWarpStatus.lastPresentationOwnerReason
+                        : "unknown");
+                ImGui::Text("  Raw Msg/Fwd/Sample: %llu / %llu / %llu",
+                    State::Instance().frameWarpStatus.rawInputMessageCount,
+                    State::Instance().frameWarpStatus.rawInputForwardedCount,
+                    State::Instance().frameWarpStatus.rawInputSampleCount);
+                ImGui::Text("  Raw Hz/SinceSnap/Prediction: %.0f / %u / %s",
+                    State::Instance().frameWarpStatus.rawInputSampleHz,
+                    State::Instance().frameWarpStatus.rawInputSamplesSinceSnapshot,
+                    State::Instance().frameWarpStatus.lastInputPredictionApplied ? "Y" : "N");
+                ImGui::TextWrapped("  FSRFG phase/policy/reuse: %s / %s / %s",
+                    State::Instance().frameWarpStatus.fsrfgLastPhase[0]
+                        ? State::Instance().frameWarpStatus.fsrfgLastPhase
+                        : "none",
+                    State::Instance().frameWarpStatus.fsrfgLastPolicy[0]
+                        ? State::Instance().frameWarpStatus.fsrfgLastPolicy
+                        : "none",
+                    State::Instance().frameWarpStatus.fsrfgLastReuseFramePose ? "Y" : "N");
+                ImGui::TextWrapped("  Stable UI: %s age=%llu clean=%s repair=%s",
+                    State::Instance().frameWarpStatus.lastStableUiSource[0]
+                        ? State::Instance().frameWarpStatus.lastStableUiSource
+                        : "none",
+                    State::Instance().frameWarpStatus.lastStableUiAge,
+                    State::Instance().frameWarpStatus.lastStableUiCleanSceneValid ? "Y" : "N",
+                    State::Instance().frameWarpStatus.lastStableUiRepairSource[0]
+                        ? State::Instance().frameWarpStatus.lastStableUiRepairSource
+                        : "none");
+                ImGui::Text("  Raw Source: %s",
+                    State::Instance().frameWarpStatus.lastRawInputSource[0]
+                        ? State::Instance().frameWarpStatus.lastRawInputSource
+                        : "none");
+                ImGui::Text("  Raw Active/Inactive: %s / %llu",
+                    State::Instance().frameWarpStatus.activeRawInputSource[0]
+                        ? State::Instance().frameWarpStatus.activeRawInputSource
+                        : "none",
+                    State::Instance().frameWarpStatus.rawInputInactiveSourceCount);
+                ImGui::Text("  Raw Interval ms: %.3f avg %.3f sd %.3f max %.3f",
+                    State::Instance().frameWarpStatus.rawInputIntervalMinMs,
+                    State::Instance().frameWarpStatus.rawInputIntervalMeanMs,
+                    State::Instance().frameWarpStatus.rawInputIntervalStdDevMs,
+                    State::Instance().frameWarpStatus.rawInputIntervalMaxMs);
+                ImGui::Text("  Snapshot/Input Age: %.3f / %.3f ms",
+                    State::Instance().frameWarpStatus.lastSnapshotAgeMs,
+                    State::Instance().frameWarpStatus.lastInputSampleAgeMs);
+                ImGui::Text("  FSRFG interval ms: %.3f avg %.3f sd %.3f",
+                    State::Instance().frameWarpStatus.fsrfgPresentIntervalMs,
+                    State::Instance().frameWarpStatus.fsrfgPresentIntervalMeanMs,
+                    State::Instance().frameWarpStatus.fsrfgPresentIntervalStdDevMs);
+                if (State::Instance().activeFgOutput == FGOutput::DLSSG)
+                {
+                    ImGui::Text("  DLSSG mode: %u", State::Instance().frameWarpStatus.dlssgFrameWarpMode);
+                    ImGui::TextWrapped("  Native DLSSG: detected=%s attach=%s passthrough=%s eval=%llu lastFrame=%llu module=%s",
+                        State::Instance().dlssgNativeStreamlineDetected ? "Y" : "N",
+                        State::Instance().dlssgNativeAttachActive ? "Y" : "N",
+                        State::Instance().dlssgNativePassthroughActive ? "Y" : "N",
+                        State::Instance().dlssgNativeEvaluateCount,
+                        State::Instance().dlssgNativeLastEvaluateFrame,
+                        State::Instance().dlssgNativeLastModule[0]
+                            ? State::Instance().dlssgNativeLastModule
+                            : "none");
+                    ImGui::TextWrapped("  DLSSG distortion: %s %llu/%llu skip=%llu (%s)",
+                        State::Instance().frameWarpStatus.dlssgDistortionLastInjected ? "Y" : "N",
+                        State::Instance().frameWarpStatus.dlssgDistortionInjectedCount,
+                        State::Instance().frameWarpStatus.dlssgDistortionAttemptCount,
+                        State::Instance().frameWarpStatus.dlssgDistortionSkippedCount,
+                        State::Instance().frameWarpStatus.dlssgDistortionLastReason[0]
+                            ? State::Instance().frameWarpStatus.dlssgDistortionLastReason
+                            : "none");
+                    ImGui::TextWrapped("  VibeFlex 2: %s %llu/%llu skip=%llu safety=%s (%s)",
+                        State::Instance().frameWarpStatus.dlssgLatePresentLastApplied ? "Y" : "N",
+                        State::Instance().frameWarpStatus.dlssgLatePresentAppliedCount,
+                        State::Instance().frameWarpStatus.dlssgLatePresentAttemptCount,
+                        State::Instance().frameWarpStatus.dlssgLatePresentSkippedCount,
+                        State::Instance().frameWarpStatus.dlssgLatePresentSafetySuppressed ? "Y" : "N",
+                        State::Instance().frameWarpStatus.dlssgLatePresentLastReason[0]
+                            ? State::Instance().frameWarpStatus.dlssgLatePresentLastReason
+                            : "none");
+                    ImGui::TextWrapped("  DLSSG resource warp: %s cand=%llu accept=%llu submit=%llu apply=%llu skip=%llu inflight=%llu dst=%llX src=%llX %ux%u fmt=%u (%s)",
+                        State::Instance().frameWarpStatus.dlssgResourceWarpLastApplied ? "Y" : "N",
+                        State::Instance().frameWarpStatus.dlssgResourceWarpCandidateCount,
+                        State::Instance().frameWarpStatus.dlssgResourceWarpAcceptedCount,
+                        State::Instance().frameWarpStatus.dlssgResourceWarpSubmittedCount,
+                        State::Instance().frameWarpStatus.dlssgResourceWarpAppliedCount,
+                        State::Instance().frameWarpStatus.dlssgResourceWarpSkippedCount,
+                        State::Instance().frameWarpStatus.dlssgResourceWarpInFlightSkipCount,
+                        State::Instance().frameWarpStatus.dlssgResourceWarpLastDst,
+                        State::Instance().frameWarpStatus.dlssgResourceWarpLastSrc,
+                        State::Instance().frameWarpStatus.dlssgResourceWarpLastWidth,
+                        State::Instance().frameWarpStatus.dlssgResourceWarpLastHeight,
+                        State::Instance().frameWarpStatus.dlssgResourceWarpLastFormat,
+                        State::Instance().frameWarpStatus.dlssgResourceWarpLastReason[0]
+                            ? State::Instance().frameWarpStatus.dlssgResourceWarpLastReason
+                            : "none");
+                    ImGui::TextWrapped("  DLSSG resource policy: %s confidence=%u (%s)",
+                        State::Instance().frameWarpStatus.dlssgResourceWarpPolicyName[0]
+                            ? State::Instance().frameWarpStatus.dlssgResourceWarpPolicyName
+                            : "unknown",
+                        State::Instance().frameWarpStatus.dlssgResourceWarpCompatibilityConfidence,
+                        State::Instance().frameWarpStatus.dlssgResourceWarpCompatibilityReason[0]
+                            ? State::Instance().frameWarpStatus.dlssgResourceWarpCompatibilityReason
+                            : "none");
+                    ImGui::TextWrapped("  DLSSG phase dry-run: %s conf=%.2f eligible=%s boundary=%llu same=%llu heur=%llu unk=%llu (%s)",
+                        State::Instance().frameWarpStatus.dlssgPhaseClassifyLabel[0]
+                            ? State::Instance().frameWarpStatus.dlssgPhaseClassifyLabel
+                            : "none",
+                        State::Instance().frameWarpStatus.dlssgPhaseClassifyConfidence,
+                        State::Instance().frameWarpStatus.dlssgPhaseClassifyFutureEligible ? "Y" : "N",
+                        State::Instance().frameWarpStatus.dlssgPhaseClassifyBoundaryCount,
+                        State::Instance().frameWarpStatus.dlssgPhaseClassifySameSnapshotCount,
+                        State::Instance().frameWarpStatus.dlssgPhaseClassifyHeuristicCount,
+                        State::Instance().frameWarpStatus.dlssgPhaseClassifyUnknownCount,
+                        State::Instance().frameWarpStatus.dlssgPhaseClassifyReason[0]
+                            ? State::Instance().frameWarpStatus.dlssgPhaseClassifyReason
+                            : "none");
+                }
+                if (State::Instance().frameWarpStatus.xefgPresentStatusSeen)
+                {
+                    ImGui::Text("  XeFG: #%llu frames=%u enabled=%s fgResult=%d query=%d",
+                        State::Instance().frameWarpStatus.xefgPresentStatusCount,
+                        State::Instance().frameWarpStatus.xefgLastFramesPresented,
+                        State::Instance().frameWarpStatus.xefgLastFrameGenEnabled ? "Y" : "N",
+                        State::Instance().frameWarpStatus.xefgLastFrameGenResult,
+                        State::Instance().frameWarpStatus.xefgLastPresentStatusResult);
+                    ImGui::TextWrapped("  XeFG final: present=%llu sync=%llu async=%llu warp=%llu/%llu skip=%llu last=%s",
+                        State::Instance().frameWarpStatus.xefgFinalPresentCount,
+                        State::Instance().frameWarpStatus.xefgFinalPresentInternalCount,
+                        State::Instance().frameWarpStatus.xefgFinalPresentAsyncCount,
+                        State::Instance().frameWarpStatus.xefgFinalWarpAppliedCount,
+                        State::Instance().frameWarpStatus.xefgFinalWarpAttemptCount,
+                        State::Instance().frameWarpStatus.xefgFinalWarpSkippedCount,
+                        State::Instance().frameWarpStatus.xefgFinalPresentLastInternal ? "sync" : "async");
+                }
+                ImGui::Text("  FOV: %.1f deg (%s)",
+                    State::Instance().frameWarpStatus.lastVFovRadians * 57.29578f,
+                    State::Instance().frameWarpStatus.lastFovSource[0]
+                        ? State::Instance().frameWarpStatus.lastFovSource
+                        : "unknown");
+                ImGui::Text("  Calibration: %s",
+                    State::Instance().frameWarpStatus.lastCalibrationSource[0]
+                        ? State::Instance().frameWarpStatus.lastCalibrationSource
+                        : "unknown");
+                ImGui::TextWrapped("  Depth: %s, %s, %ux%u fmt=%u",
+                    State::Instance().frameWarpStatus.lastDepthUsed ? "active" : "inactive",
+                    State::Instance().frameWarpStatus.lastDepthReason[0]
+                        ? State::Instance().frameWarpStatus.lastDepthReason
+                        : "unknown",
+                    State::Instance().frameWarpStatus.lastDepthWidth,
+                    State::Instance().frameWarpStatus.lastDepthHeight,
+                    State::Instance().frameWarpStatus.lastDepthFormat);
+                ImGui::Text("  Manual rad/count: %.5f", Config::Instance()->FrameWarpSensitivity.value_or_default());
+                if (false /* removed */)
+                {
+                    ImGui::Text("  Warp Frames: %llu", 0 /* removed */);
+                }
+                ImGui::TreePop();
+                }
+            }
+        }
+    }
 
                 // FAKENVAPI ---------------------------
                 if (fakenvapi::isUsingFakenvapi())
@@ -7056,9 +8297,48 @@ void MenuCommon::Init(HWND InHwnd, bool isUWP)
         _oWndProc = (WNDPROC) SetWindowLongPtr(InHwnd, GWLP_WNDPROC, (LONG_PTR) WndProc);
 
     LOG_DEBUG("_oWndProc: {0:X}", (ULONG64) _oWndProc);
+    State::Instance().frameWarpHwnd = InHwnd;
 
-    if (!pfn_SetCursorPos_hooked)
+    if (!pfn_SetCursorPos_hooked && !pfn_GetRawInputData_hooked)
         AttachHooks();
+
+    // Register for raw mouse input with RIDEV_INPUTSINK so WM_INPUT is delivered
+    // even if the game uses DirectInput/SDL2 polling instead of WM_INPUT.
+    // This is essential for Frame Warp: we need the actual mouse position at
+    // present time to compute the render-to-present latency delta.
+    {
+        HWND registeredTarget = nullptr;
+        DWORD registeredFlags = 0;
+        if (FrameWarpFindRegisteredRawMouse(&registeredTarget, &registeredFlags))
+        {
+            auto& status = State::Instance().frameWarpStatus;
+            status.rawInputRegistrationSeen = true;
+            LOG_DEBUG("FrameWarp: raw mouse already registered (flags=0x{:X}, hwnd={}); observing instead of stealing",
+                registeredFlags, (void*)registeredTarget);
+            TrackFrameWarpRawInputWindow(registeredTarget);
+        }
+        else
+        {
+            RAWINPUTDEVICE rid {};
+            rid.usUsagePage = 0x01;  // HID_USAGE_PAGE_GENERIC
+            rid.usUsage = 0x02;      // HID_USAGE_GENERIC_MOUSE
+            rid.dwFlags = RIDEV_INPUTSINK;  // Receive input even when not in foreground
+            rid.hwndTarget = InHwnd;
+
+            BOOL registered = pfn_RegisterRawInputDevices != nullptr
+                ? pfn_RegisterRawInputDevices(&rid, 1, sizeof(rid))
+                : RegisterRawInputDevices(&rid, 1, sizeof(rid));
+            if (registered)
+            {
+                State::Instance().frameWarpStatus.rawInputRegistrationSeen = true;
+                LOG_DEBUG("FrameWarp: Registered fallback raw mouse input sink");
+            }
+            else
+            {
+                LOG_WARN("FrameWarp: Failed to register raw mouse input sink (err={})", GetLastError());
+            }
+        }
+    }
 
     ApplyThemeStyle();
     _isInited = true;
@@ -7075,7 +8355,8 @@ void MenuCommon::Shutdown()
         _oWndProc = nullptr;
     }
 
-    if (pfn_SetCursorPos_hooked)
+    if (pfn_SetCursorPos_hooked || pfn_RegisterRawInputDevices_hooked || pfn_GetRawInputData_hooked ||
+        pfn_GetRawInputBuffer_hooked)
         DetachHooks();
 
     if (!_isUWP)

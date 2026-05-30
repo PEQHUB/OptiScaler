@@ -8,6 +8,7 @@
 
 #include <spoofing/Dxgi_Spoofing.h>
 #include <wrapped/wrapped_swapchain.h>
+#include <inputs/FG/Upscaler_Inputs_Dx11.h>
 
 #include <magic_enum.hpp>
 #include <detours/detours.h>
@@ -19,6 +20,31 @@
 #ifdef DETAILED_SC_LOGS
 #include <magic_enum.hpp>
 #endif
+
+static void LogSwapchainCreateFailure(const char* functionName, HRESULT result)
+{
+    const bool nativeDLSSG =
+        State::Instance().activeFgOutput == FGOutput::DLSSG &&
+        (State::Instance().dlssgNativeStreamlineDetected ||
+         State::Instance().dlssgNativeAttachActive ||
+         State::Instance().dlssgNativePassthroughActive);
+    const bool expectedNativeRetry = nativeDLSSG && result == E_ACCESSDENIED;
+
+    static uint64_t nativeRetryLogCount = 0;
+    if (expectedNativeRetry)
+    {
+        nativeRetryLogCount++;
+        if (nativeRetryLogCount <= 10 || nativeRetryLogCount % 300 == 0)
+        {
+            LOG_DEBUG("{} failed: {:X} while native DLSSG is active; treating as pass-through retry",
+                      functionName != nullptr ? functionName : "CreateSwapChain",
+                      (UINT) result);
+        }
+        return;
+    }
+
+    LOG_ERROR("{} failed: {:X}", functionName != nullptr ? functionName : "CreateSwapChain", (UINT) result);
+}
 
 void DxgiFactoryHooks::CheckAdapter(IUnknown* unkAdapter)
 {
@@ -350,6 +376,59 @@ HRESULT DxgiFactoryHooks::CreateSwapChain(IDXGIFactory* realFactory, IUnknown* p
                 State::Instance().currentD3D11AdepterDesc = {};
             }
         }
+
+        auto* dx12Queue = State::Instance().dx12QueueForDx11FG;
+        if (dx12Queue != nullptr && !_skipFGSwapChainCreation && State::Instance().activeFgOutput != FGOutput::NoFG)
+        {
+            LOG_INFO("DX11 FG: Attempting FG swapchain creation with DX12 queue {:X}", (size_t) dx12Queue);
+            ScopedSkipFGSCCreation skipFGSCCreation {};
+
+            DXGI_SWAP_CHAIN_DESC fgDesc = *pDesc;
+            if (fgDesc.SwapEffect == DXGI_SWAP_EFFECT_SEQUENTIAL)
+                fgDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+            else if (fgDesc.SwapEffect == DXGI_SWAP_EFFECT_DISCARD)
+                fgDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+
+            if (fgDesc.BufferCount < 2)
+                fgDesc.BufferCount = 2;
+
+            FGSCResult = FGHooks::CreateSwapChain(realFactory, dx12Queue, &fgDesc, ppSwapChain);
+
+            if (FGSCResult == S_OK)
+            {
+                State::Instance().dx11FGMode = true;
+                State::Instance().currentSwapchainDesc = fgDesc;
+
+                if (Util::GetProcessWindow() == pDesc->OutputWindow)
+                {
+                    State::Instance().screenWidth = static_cast<float>(pDesc->BufferDesc.Width);
+                    State::Instance().screenHeight = static_cast<float>(pDesc->BufferDesc.Height);
+                }
+
+                ID3D11Device* dx11Dev = nullptr;
+                pDevice->QueryInterface(IID_PPV_ARGS(&dx11Dev));
+
+                IDXGISwapChain* fgSwapChain = *ppSwapChain;
+                auto* proxy = new WrappedIDXGISwapChain4(fgSwapChain, pDevice, pDesc->OutputWindow, pDesc->Flags, false);
+                proxy->InitDx11FGProxy(fgSwapChain, dx11Dev, State::Instance().dx12DeviceForDx11FG,
+                                       State::Instance().dx12QueueForDx11FG, pDesc);
+
+                UpscalerInputsDx11::Init(dx11Dev, State::Instance().dx12DeviceForDx11FG);
+
+                if (dx11Dev)
+                    dx11Dev->Release();
+
+                *ppSwapChain = proxy;
+                State::Instance().currentSwapchain = proxy;
+                State::Instance().currentWrappedSwapchain = proxy;
+
+                LOG_INFO("DX11 FG: Proxy swapchain created, FG swapchain: {:X}, proxy: {:X}", (size_t) fgSwapChain,
+                         (size_t) proxy);
+                return S_OK;
+            }
+
+            LOG_WARN("DX11 FG: FG swapchain creation failed ({:X}), falling back to normal DX11", (UINT) FGSCResult);
+        }
     }
 
     HRESULT result = E_FAIL;
@@ -418,7 +497,7 @@ HRESULT DxgiFactoryHooks::CreateSwapChain(IDXGIFactory* realFactory, IUnknown* p
     }
     else
     {
-        LOG_ERROR("CreateSwapChain failed: {:X}", (UINT) result);
+        LogSwapchainCreateFailure("CreateSwapChain", result);
     }
 
     return result;
@@ -674,6 +753,73 @@ HRESULT DxgiFactoryHooks::CreateSwapChainForHwnd(IDXGIFactory2* realFactory, IUn
                 State::Instance().currentD3D11AdepterDesc = {};
             }
         }
+
+        auto* dx12Queue = State::Instance().dx12QueueForDx11FG;
+        if (dx12Queue != nullptr && !_skipFGSwapChainCreation && State::Instance().activeFgOutput != FGOutput::NoFG)
+        {
+            LOG_INFO("DX11 FG: Attempting FG swapchain creation (ForHwnd) with DX12 queue {:X}", (size_t) dx12Queue);
+            ScopedSkipFGSCCreation skipFGSCCreation {};
+
+            DXGI_SWAP_CHAIN_DESC1 fgDesc = *pDesc;
+            if (fgDesc.SwapEffect == DXGI_SWAP_EFFECT_SEQUENTIAL)
+                fgDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+            else if (fgDesc.SwapEffect == DXGI_SWAP_EFFECT_DISCARD)
+                fgDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+
+            if (fgDesc.BufferCount < 2)
+                fgDesc.BufferCount = 2;
+
+            FGSCResult = FGHooks::CreateSwapChainForHwnd(realFactory, dx12Queue, hWnd, &fgDesc,
+                                                         pFullscreenDesc != nullptr ? &localFullscreenDesc : nullptr,
+                                                         pRestrictToOutput, ppSwapChain);
+
+            if (FGSCResult == S_OK)
+            {
+                State::Instance().dx11FGMode = true;
+                ((IDXGISwapChain*) *ppSwapChain)->GetDesc(&State::Instance().currentSwapchainDesc);
+
+                if (Util::GetProcessWindow() == hWnd)
+                {
+                    State::Instance().screenWidth = static_cast<float>(pDesc->Width);
+                    State::Instance().screenHeight = static_cast<float>(pDesc->Height);
+                }
+
+                ID3D11Device* dx11Dev = nullptr;
+                pDevice->QueryInterface(IID_PPV_ARGS(&dx11Dev));
+
+                DXGI_SWAP_CHAIN_DESC proxyDesc = {};
+                proxyDesc.BufferDesc.Width = pDesc->Width;
+                proxyDesc.BufferDesc.Height = pDesc->Height;
+                proxyDesc.BufferDesc.Format = pDesc->Format;
+                proxyDesc.SampleDesc = pDesc->SampleDesc;
+                proxyDesc.BufferUsage = pDesc->BufferUsage;
+                proxyDesc.BufferCount = pDesc->BufferCount;
+                proxyDesc.OutputWindow = hWnd;
+                proxyDesc.Windowed = TRUE;
+                proxyDesc.SwapEffect = pDesc->SwapEffect;
+                proxyDesc.Flags = pDesc->Flags;
+
+                IDXGISwapChain* fgSwapChain = (IDXGISwapChain*) *ppSwapChain;
+                auto* proxy = new WrappedIDXGISwapChain4(fgSwapChain, pDevice, hWnd, pDesc->Flags, false);
+                proxy->InitDx11FGProxy(fgSwapChain, dx11Dev, State::Instance().dx12DeviceForDx11FG,
+                                       State::Instance().dx12QueueForDx11FG, &proxyDesc);
+
+                UpscalerInputsDx11::Init(dx11Dev, State::Instance().dx12DeviceForDx11FG);
+
+                if (dx11Dev)
+                    dx11Dev->Release();
+
+                *ppSwapChain = (IDXGISwapChain1*) proxy;
+                State::Instance().currentSwapchain = (IDXGISwapChain*) proxy;
+                State::Instance().currentWrappedSwapchain = (IDXGISwapChain*) proxy;
+
+                LOG_INFO("DX11 FG: Proxy swapchain (ForHwnd) created, FG: {:X}, proxy: {:X}", (size_t) fgSwapChain,
+                         (size_t) proxy);
+                return S_OK;
+            }
+
+            LOG_WARN("DX11 FG: FG swapchain creation failed (ForHwnd) ({:X}), falling back", (UINT) FGSCResult);
+        }
     }
 
     HRESULT result = E_FAIL;
@@ -741,7 +887,7 @@ HRESULT DxgiFactoryHooks::CreateSwapChainForHwnd(IDXGIFactory2* realFactory, IUn
         }
         else
         {
-            LOG_ERROR("CreateSwapChainForHwnd failed: {:X}", (UINT) result);
+            LogSwapchainCreateFailure("CreateSwapChainForHwnd", result);
         }
     }
 

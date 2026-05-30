@@ -70,7 +70,8 @@ void fakenvapi::reportFGPresent(IDXGISwapChain* pSwapChain, bool fg_state, bool 
                 Fake_InformPresentFG(frame_interpolated, 0);
             }
         }
-        else if (State::Instance().activeFgOutput == FGOutput::XeFG)
+        else if (State::Instance().activeFgOutput == FGOutput::XeFG ||
+                 State::Instance().activeFgOutput == FGOutput::DLSSG)
         {
             if (updateModeAndContext())
             {
@@ -90,7 +91,14 @@ void fakenvapi::reportFGPresent(IDXGISwapChain* pSwapChain, bool fg_state, bool 
 
 bool fakenvapi::updateModeAndContext()
 {
-    if (!isUsingFakenvapi() && State::Instance().activeFgOutput == FGOutput::XeFG &&
+    // DX11 FG mode: don't load fakenvapi.dll; Reflex is routed directly to the hidden
+    // DX12 device via o_NvAPI_D3D_Sleep. Loading fakenvapi would set mode to LatencyFlex
+    // and the menu would display "LatencyFlex" instead of "Reflex".
+    if (State::Instance().dx11FGMode)
+        return false;
+
+    if (!isUsingFakenvapi() &&
+        (State::Instance().activeFgOutput == FGOutput::XeFG || State::Instance().activeFgOutput == FGOutput::DLSSG) &&
         !Config::Instance()->DontUseFakenvapiForXeLLOnNvidia.value_or_default())
     {
         auto loaded = fakenvapi::loadForNvidia();
@@ -132,7 +140,13 @@ bool fakenvapi::updateModeAndContext()
 
 bool fakenvapi::setModeAndContext(void* context, Mode mode)
 {
-    if (!isUsingFakenvapi() && State::Instance().activeFgOutput == FGOutput::XeFG &&
+    // DX11 FG mode: don't load fakenvapi.dll; Reflex is handled via direct NvAPI calls
+    // to the hidden DX12 device.
+    if (State::Instance().dx11FGMode)
+        return false;
+
+    if (!isUsingFakenvapi() &&
+        (State::Instance().activeFgOutput == FGOutput::XeFG || State::Instance().activeFgOutput == FGOutput::DLSSG) &&
         !Config::Instance()->DontUseFakenvapiForXeLLOnNvidia.value_or_default())
     {
         auto loaded = fakenvapi::loadForNvidia();

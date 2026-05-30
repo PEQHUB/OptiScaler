@@ -5,6 +5,74 @@
 
 #include <magic_enum.hpp>
 
+bool IFGFeature_Dx12::CreateUIFences()
+{
+    if (_device == nullptr)
+        return false;
+
+    for (size_t i = 0; i < BUFFER_COUNT; i++)
+    {
+        auto result = _device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&_uiFence[i]));
+        if (result != S_OK)
+        {
+            LOG_ERROR("CreateFence _uiFence[{}]: {:X}", i, (unsigned long) result);
+            return false;
+        }
+        _uiFence[i]->SetName(std::format(L"_uiFence[{}]", i).c_str());
+        _uiFenceValue[i] = 0;
+    }
+
+    _uiFenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (_uiFenceEvent == nullptr)
+    {
+        LOG_ERROR("CreateEvent for UI fence failed");
+        return false;
+    }
+
+    return true;
+}
+
+void IFGFeature_Dx12::ReleaseUIFences()
+{
+    for (size_t i = 0; i < BUFFER_COUNT; i++)
+    {
+        if (_uiFence[i] != nullptr)
+        {
+            _uiFence[i]->Release();
+            _uiFence[i] = nullptr;
+        }
+        _uiFenceValue[i] = 0;
+    }
+
+    if (_uiFenceEvent != nullptr)
+    {
+        CloseHandle(_uiFenceEvent);
+        _uiFenceEvent = nullptr;
+    }
+}
+
+void IFGFeature_Dx12::SignalUIFence(int fIndex)
+{
+    if (_gameCommandQueue == nullptr || _uiFence[fIndex] == nullptr)
+        return;
+
+    _uiFenceValue[fIndex]++;
+    _gameCommandQueue->Signal(_uiFence[fIndex], _uiFenceValue[fIndex]);
+}
+
+void IFGFeature_Dx12::WaitUIFence(int index)
+{
+    auto& fence = _uiFence[index];
+    if (fence == nullptr || _uiFenceValue[index] == 0)
+        return;
+
+    if (fence->GetCompletedValue() < _uiFenceValue[index])
+    {
+        fence->SetEventOnCompletion(_uiFenceValue[index], _uiFenceEvent);
+        WaitForSingleObject(_uiFenceEvent, 5000);
+    }
+}
+
 bool IFGFeature_Dx12::GetResourceCopy(FG_ResourceType type, D3D12_RESOURCE_STATES bufferState, ID3D12Resource* output)
 {
     if (!InitCopyCmdList())
@@ -81,6 +149,9 @@ ID3D12GraphicsCommandList* IFGFeature_Dx12::GetUICommandList(int index)
 
     if (!_uiCommandListResetted[index])
     {
+        // Wait for previous GPU work on this command allocator to complete
+        WaitUIFence(index);
+
         auto result = _uiCommandAllocator[index]->Reset();
 
         if (result == S_OK)
@@ -95,10 +166,14 @@ ID3D12GraphicsCommandList* IFGFeature_Dx12::GetUICommandList(int index)
         else
         {
             LOG_ERROR("_uiCommandAllocator[{}]->Reset() error: {:X}", index, (UINT) result);
-        }
-    }
+			// Return nullptr instead of a stale command list.
+			// The command list is not in a recording state and recording into it
+			// would crash. Callers already check for nullptr.
+			return nullptr;
+		}
+	}
 
-    return _uiCommandList[index];
+	return _uiCommandList[index];
 }
 
 ID3D12GraphicsCommandList* IFGFeature_Dx12::GetSCCommandList(int index)
@@ -415,6 +490,12 @@ bool IFGFeature_Dx12::CreateBufferResource(ID3D12Device* device, ID3D12Resource*
     D3D12_HEAP_PROPERTIES heapProperties;
     D3D12_HEAP_FLAGS heapFlags;
     auto hr = source->GetHeapProperties(&heapProperties, &heapFlags);
+
+    if (hr != S_OK)
+    {
+        LOG_ERROR("GetHeapProperties result: {:X}", (UINT64) hr);
+        return false;
+    }
 
     hr = device->CreateCommittedResource(&heapProperties, D3D12_HEAP_FLAG_NONE, &inDesc, initialState, nullptr,
                                          IID_PPV_ARGS(target));

@@ -6,6 +6,7 @@
 #include <Config.h>
 
 #include <framegen/IFGFeature_Dx12.h>
+#include <framewarp/FrameWarp.h>
 
 inline static int GetFormatGroup(DXGI_FORMAT format)
 {
@@ -409,6 +410,16 @@ bool Hudfix_Dx12::CheckResource(ResourceInfo* resource)
         return true;
     }
 
+    // Upscaler output IS the HUD-less frame by definition (HUD drawn after upscaler).
+    // Always accept regardless of format — FT_Dx12 handles conversion.
+    if (source == CaptureInfo::Upscaler)
+    {
+        LOG_DEBUG("{}->{} Width: {}/{}, Height: {}/{}, Format: {}/{}, Resource: {:X} -> TRUE (Upscaler bypass)",
+                  GetSourceString(source), GetDispatchString(dispatcher), resDesc.Width, width, resDesc.Height, height,
+                  (UINT) resDesc.Format, (UINT) s.currentSwapchainDesc.BufferDesc.Format, (size_t) resource->buffer);
+        return true;
+    }
+
     // extended not active
     if (!Config::Instance()->FGHUDFixExtended.value_or_default())
     {
@@ -522,8 +533,40 @@ UINT64 Hudfix_Dx12::ActiveUpscaleFrame() { return _upscaleCounter; }
 
 UINT64 Hudfix_Dx12::ActivePresentFrame() { return _fgCounter; }
 
+static bool FrameWarpStandaloneHudfixAllowed(Config* config, State& state, bool fgHudfixActive)
+{
+    const bool standaloneOwner =
+        FrameWarpRuntime::ResolvePresentationOwner("HUDFix", false) == FrameWarpPresentationOwner::StandaloneNoFG;
+
+    return config->FrameWarpEnabled.value_or_default() &&
+        config->FGHUDFix.value_or_default() &&
+        state.currentFeature != nullptr &&
+        state.currentD3D12Device != nullptr &&
+        state.currentSwapchain != nullptr &&
+        standaloneOwner &&
+        !state.FGchanged &&
+        !fgHudfixActive;
+}
+
+static bool FrameWarpDLSSGLatePresentHudfixAllowed(Config* config, State& state, bool fgHudfixActive)
+{
+    return config->FrameWarpEnabled.value_or_default() &&
+        config->FGHUDFix.value_or_default() &&
+        (config->FrameWarpDLSSGMode.value_or_default() == 3 ||
+         config->FrameWarpDLSSGMode.value_or_default() == 4) &&
+        state.activeFgOutput == FGOutput::DLSSG &&
+        state.currentFeature != nullptr &&
+        state.currentD3D12Device != nullptr &&
+        state.currentSwapchain != nullptr &&
+        fgHudfixActive &&
+        !state.FGchanged;
+}
+
 bool Hudfix_Dx12::IsResourceCheckActive()
 {
+    auto config = Config::Instance();
+    auto& state = State::Instance();
+
     if (_skipTracking)
     {
         // LOG_TRACK("_skipHudlessChecks");
@@ -542,24 +585,18 @@ bool Hudfix_Dx12::IsResourceCheckActive()
         return false;
     }
 
-    if (!Config::Instance()->FGEnabled.value_or_default() || !Config::Instance()->FGHUDFix.value_or_default())
-    {
-        // LOG_TRACK(
-        //     "!Config::Instance()->FGEnabled.value_or_default() || !Config::Instance()->FGHUDFix.value_or_default()");
-        return false;
-    }
+    const bool fgHudfixActive =
+        config->FGEnabled.value_or_default() &&
+        config->FGHUDFix.value_or_default() &&
+        state.currentFeature != nullptr &&
+        state.currentFG != nullptr &&
+        state.currentFG->IsActive() &&
+        !state.currentFG->IsPaused() &&
+        !state.FGchanged;
+    const bool frameWarpNoFgHudfixActive = FrameWarpStandaloneHudfixAllowed(config, state, fgHudfixActive);
 
-    if (State::Instance().currentFeature == nullptr || State::Instance().currentFG == nullptr)
-    {
-        // LOG_TRACK("State::Instance().currentFeature == nullptr || State::Instance().currentFG == nullptr");
+    if (!fgHudfixActive && !frameWarpNoFgHudfixActive)
         return false;
-    }
-
-    if (!State::Instance().currentFG->IsActive() || State::Instance().FGchanged)
-    {
-        // LOG_TRACK("!State::Instance().currentFG->IsActive() || State::Instance().FGchanged");
-        return false;
-    }
 
     return true;
 }
@@ -570,9 +607,39 @@ bool Hudfix_Dx12::CheckForHudless(ID3D12GraphicsCommandList* cmdList, ResourceIn
                                   D3D12_RESOURCE_STATES state, bool ignoreBlocked)
 {
     auto& s = State::Instance();
+    auto config = Config::Instance();
 
-    if (s.currentFG == nullptr)
+    const bool fgHudfixActive =
+        config->FGEnabled.value_or_default() &&
+        config->FGHUDFix.value_or_default() &&
+        s.currentFG != nullptr &&
+        s.currentFG->IsActive() &&
+        !s.currentFG->IsPaused() &&
+        !s.FGchanged;
+    const bool frameWarpStandaloneHudfix =
+        FrameWarpStandaloneHudfixAllowed(config, s, fgHudfixActive);
+    const bool frameWarpDLSSGLatePresentHudfix =
+        FrameWarpDLSSGLatePresentHudfixAllowed(config, s, fgHudfixActive);
+
+    if (!fgHudfixActive && !frameWarpStandaloneHudfix)
+    {
+        if (config->FrameWarpEnabled.value_or_default() &&
+            config->FGHUDFix.value_or_default() &&
+            s.activeFgOutput != FGOutput::NoFG)
+        {
+            static uint64_t skippedFgOutputLogCount = 0;
+            skippedFgOutputLogCount++;
+            if (skippedFgOutputLogCount <= 20 || skippedFgOutputLogCount % 600 == 0)
+            {
+                LOG_DEBUG("FrameWarp HUDFix skipped: FG output configured output={} fgActive={} fgPaused={} fgChanged={}",
+                    (UINT) s.activeFgOutput,
+                    s.currentFG != nullptr && s.currentFG->IsActive(),
+                    s.currentFG != nullptr && s.currentFG->IsPaused(),
+                    s.FGchanged);
+            }
+        }
         return false;
+    }
 
     if (!IsResourceCheckActive())
         return false;
@@ -796,11 +863,19 @@ bool Hudfix_Dx12::CheckForHudless(ID3D12GraphicsCommandList* cmdList, ResourceIn
             }
         }
 
-        auto fg = s.currentFG;
+        auto fg = fgHudfixActive ? s.currentFG : nullptr;
 
         // needs conversion?
         if (!CompareResourceFormats(resource->format, s.currentSwapchainDesc.BufferDesc.Format))
         {
+            if (fg == nullptr)
+            {
+                LOG_DEBUG("FrameWarp no-FG HUDFix skipped {:X}: format mismatch resource={} swapchain={}",
+                          (size_t) resource->buffer, (UINT) resource->format,
+                          (UINT) s.currentSwapchainDesc.BufferDesc.Format);
+                break;
+            }
+
             if (_formatTransfer[fIndex] == nullptr ||
                 !_formatTransfer[fIndex]->IsFormatCompatible(s.currentSwapchainDesc.BufferDesc.Format))
             {
@@ -832,6 +907,8 @@ bool Hudfix_Dx12::CheckForHudless(ID3D12GraphicsCommandList* cmdList, ResourceIn
                     break;
 
                 auto fgCmdList = s.currentFG->GetUICommandList();
+                if (fgCmdList == nullptr)
+                    break;
 
                 // This will prevent resource tracker to check these operations
                 // Will reset after FG dispatch
@@ -863,6 +940,24 @@ bool Hudfix_Dx12::CheckForHudless(ID3D12GraphicsCommandList* cmdList, ResourceIn
                     setResource.frameIndex = fg->GetIndexWillBeDispatched();
 
                     fg->SetResource(&setResource);
+
+                    if (frameWarpDLSSGLatePresentHudfix &&
+                        FrameWarpRuntime::CaptureHudlessSource(
+                            fgCmdList,
+                            _formatTransfer[fIndex]->Buffer(),
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            s.currentSwapchainDesc.BufferDesc.Width,
+                            s.currentSwapchainDesc.BufferDesc.Height,
+                            s.currentSwapchainDesc.BufferDesc.Format,
+                            "dlssg-hudfix-format"))
+                    {
+                        static uint64_t dlssgHudfixCaptureLogCount = 0;
+                        dlssgHudfixCaptureLogCount++;
+                        if (dlssgHudfixCaptureLogCount <= 10 || dlssgHudfixCaptureLogCount % 300 == 0)
+                            LOG_DEBUG("FrameWarp DLSSG HUDFix captured formatted HUD-less source #{} {:X}",
+                                dlssgHudfixCaptureLogCount,
+                                (size_t)_formatTransfer[fIndex]->Buffer());
+                    }
                 }
             }
             else
@@ -893,6 +988,38 @@ bool Hudfix_Dx12::CheckForHudless(ID3D12GraphicsCommandList* cmdList, ResourceIn
                 setResource.frameIndex = fg->GetIndexWillBeDispatched();
 
                 fg->SetResource(&setResource);
+
+                if (frameWarpDLSSGLatePresentHudfix &&
+                    FrameWarpRuntime::CaptureHudlessSource(
+                        cmdList,
+                        _captureBuffer[fIndex],
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        s.currentSwapchainDesc.BufferDesc.Width,
+                        s.currentSwapchainDesc.BufferDesc.Height,
+                        s.currentSwapchainDesc.BufferDesc.Format,
+                        "dlssg-hudfix-capture"))
+                {
+                    static uint64_t dlssgHudfixCaptureLogCount = 0;
+                    dlssgHudfixCaptureLogCount++;
+                    if (dlssgHudfixCaptureLogCount <= 10 || dlssgHudfixCaptureLogCount % 300 == 0)
+                        LOG_DEBUG("FrameWarp DLSSG HUDFix captured HUD-less source #{} {:X}",
+                            dlssgHudfixCaptureLogCount,
+                            (size_t)_captureBuffer[fIndex]);
+                }
+            }
+            else if (frameWarpStandaloneHudfix)
+            {
+                if (FrameWarpRuntime::CaptureHudlessSource(
+                        cmdList,
+                        _captureBuffer[fIndex],
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        s.currentSwapchainDesc.BufferDesc.Width,
+                        s.currentSwapchainDesc.BufferDesc.Height,
+                        s.currentSwapchainDesc.BufferDesc.Format,
+                        "hudfix-capture"))
+                {
+                    LOG_DEBUG("FrameWarp no-FG HUDFix captured {:X} via Hudfix", (size_t) resource->buffer);
+                }
             }
         }
 
@@ -903,7 +1030,10 @@ bool Hudfix_Dx12::CheckForHudless(ID3D12GraphicsCommandList* cmdList, ResourceIn
             s.FGcapturedResourceCount = _captureList.size();
         }
 
-        LOG_DEBUG("Calling FG with hudless");
+        if (fg != nullptr)
+            LOG_DEBUG("Calling FG with hudless");
+        else
+            LOG_DEBUG("Calling FrameWarp with hudless");
 
         // This will prevent resource tracker to check these operations
         // Will reset after FG dispatch

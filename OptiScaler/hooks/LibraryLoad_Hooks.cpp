@@ -27,10 +27,107 @@
 #include <hooks/Vulkan_Hooks.h>
 #include <hooks/Gdi32_Hooks.h>
 #include <hooks/Streamline_Hooks.h>
+#include <framegen/dlssg/DLSSG_Native.h>
 
 #include <fsr4/FSR4ModelSelection.h>
 
 // #define LOG_LIB_OPERATIONS
+
+namespace
+{
+    std::wstring LowerNormalizedPath(const std::filesystem::path& input)
+    {
+        auto path = input;
+        std::error_code ec;
+        if (path.is_relative())
+        {
+            auto absolute = std::filesystem::absolute(path, ec);
+            if (!ec)
+                path = absolute;
+        }
+
+        auto lowered = path.lexically_normal().wstring();
+        to_lower_in_place(lowered);
+        return lowered;
+    }
+
+    bool PathStartsWith(const std::wstring& path, const std::wstring& root)
+    {
+        if (root.empty() || path.size() < root.size())
+            return false;
+
+        if (path.rfind(root, 0) != 0)
+            return false;
+
+        return path.size() == root.size() || path[root.size()] == L'\\' || path[root.size()] == L'/';
+    }
+
+    bool IsNativeStreamlinePath(const std::filesystem::path& rawPath)
+    {
+        const auto path = LowerNormalizedPath(rawPath);
+        const auto optiSlPath = LowerNormalizedPath(Util::DllPath().parent_path() / L"sl");
+
+        if (path.empty())
+            return false;
+
+        if (path.contains(L"sl.interposer_output.dll"))
+            return false;
+
+        if (PathStartsWith(path, optiSlPath))
+            return false;
+
+        return true;
+    }
+
+    void MarkNativeStreamlineModule(const std::filesystem::path& rawPath, const char* moduleName)
+    {
+        if (!IsNativeStreamlinePath(rawPath))
+            return;
+
+        auto& state = State::Instance();
+        const bool firstDetection = !state.dlssgNativeStreamlineDetected;
+        state.dlssgNativeStreamlineDetected = true;
+
+        if (strcmp(moduleName, "sl.interposer") == 0)
+            state.dlssgNativeInterposerLoadCount++;
+        else if (strcmp(moduleName, "sl.common") == 0)
+            state.dlssgNativeCommonLoadCount++;
+        else if (strcmp(moduleName, "sl.dlss_g") == 0)
+            state.dlssgNativeDlssgLoadCount++;
+
+        const auto mode = Config::Instance()->FGDLSSGNativeMode.value_or_default();
+        state.dlssgNativeAttachActive =
+            state.activeFgOutput == FGOutput::DLSSG &&
+            (mode == DLSSGNativeMode::Attach ||
+             (mode == DLSSGNativeMode::Auto && state.currentFG == nullptr));
+        state.dlssgNativePassthroughActive =
+            state.activeFgOutput == FGOutput::DLSSG && mode == DLSSGNativeMode::Passthrough;
+
+        strncpy_s(state.dlssgNativeLastModule, moduleName, _TRUNCATE);
+        const auto pathString = rawPath.lexically_normal().string();
+        strncpy_s(state.dlssgNativeLastPath, pathString.c_str(), _TRUNCATE);
+
+        if (firstDetection || state.dlssgNativeAttachActive || state.dlssgNativePassthroughActive)
+        {
+            LOG_INFO("Native Streamline detected module={} path={} mode={} attach={} passthrough={}",
+                     moduleName,
+                     pathString,
+                     DLSSGNative::ModeName(mode),
+                     state.dlssgNativeAttachActive,
+                     state.dlssgNativePassthroughActive);
+        }
+    }
+
+    void MarkNativeStreamlineModule(HMODULE module, const char* moduleName)
+    {
+        if (module == nullptr)
+            return;
+
+        wchar_t path[MAX_PATH] = {};
+        if (GetModuleFileNameW(module, path, MAX_PATH) > 0)
+            MarkNativeStreamlineModule(std::filesystem::path(path), moduleName);
+    }
+}
 
 HMODULE LibraryLoadHooks::LoadLibraryCheckA(std::string libName, LPCSTR lpLibFullPath)
 {
@@ -167,7 +264,18 @@ HMODULE LibraryLoadHooks::LoadLibraryCheckW(std::wstring libName, LPCWSTR lpLibF
 
         if (streamlineModule != nullptr)
         {
-            StreamlineHooks::hookInterposer(streamlineModule);
+            MarkNativeStreamlineModule(std::filesystem::path(lpLibFullPath != nullptr ? lpLibFullPath : libName.c_str()),
+                                       "sl.interposer");
+
+            if (State::Instance().activeFgOutput != FGOutput::DLSSG ||
+                DLSSGNative::ShouldHookNativeInterposer())
+            {
+                StreamlineHooks::hookInterposer(streamlineModule);
+            }
+            else
+            {
+                LOG_DEBUG("Skipping StreamlineHooks::hookInterposer - DLSSG output active");
+            }
             slInterposerModule = streamlineModule;
         }
         else
@@ -188,7 +296,10 @@ HMODULE LibraryLoadHooks::LoadLibraryCheckW(std::wstring libName, LPCWSTR lpLibF
 
         if (dlssModule != nullptr)
         {
-            StreamlineHooks::hookDlss(dlssModule);
+            if (State::Instance().activeFgOutput != FGOutput::DLSSG)
+                StreamlineHooks::hookDlss(dlssModule);
+            else
+                LOG_DEBUG("Skipping StreamlineHooks::hookDlss - DLSSG output active");
         }
         else
         {
@@ -206,7 +317,19 @@ HMODULE LibraryLoadHooks::LoadLibraryCheckW(std::wstring libName, LPCWSTR lpLibF
 
         if (dlssgModule != nullptr)
         {
-            StreamlineHooks::hookDlssg(dlssgModule);
+            MarkNativeStreamlineModule(std::filesystem::path(lpLibFullPath != nullptr ? lpLibFullPath : libName.c_str()),
+                                       "sl.dlss_g");
+
+            if (!DLSSGNative::ShouldSkipStreamlinePluginHooks())
+            {
+                // Needed for JSON patching (hws.required=false, vsync.supported=true)
+                // and systemCaps spoofing in OptiScaler-owned DLSSG output mode.
+                StreamlineHooks::hookDlssg(dlssgModule);
+            }
+            else
+            {
+                LOG_DEBUG("Skipping StreamlineHooks::hookDlssg - native DLSSG mode active");
+            }
         }
         else
         {
@@ -224,7 +347,10 @@ HMODULE LibraryLoadHooks::LoadLibraryCheckW(std::wstring libName, LPCWSTR lpLibF
 
         if (reflexModule != nullptr)
         {
-            StreamlineHooks::hookReflex(reflexModule);
+            if (State::Instance().activeFgOutput != FGOutput::DLSSG)
+                StreamlineHooks::hookReflex(reflexModule);
+            else
+                LOG_DEBUG("Skipping StreamlineHooks::hookReflex - DLSSG output active");
         }
         else
         {
@@ -242,7 +368,10 @@ HMODULE LibraryLoadHooks::LoadLibraryCheckW(std::wstring libName, LPCWSTR lpLibF
 
         if (pclModule != nullptr)
         {
-            StreamlineHooks::hookPcl(pclModule);
+            if (State::Instance().activeFgOutput != FGOutput::DLSSG)
+                StreamlineHooks::hookPcl(pclModule);
+            else
+                LOG_DEBUG("Skipping StreamlineHooks::hookPcl - DLSSG output active");
         }
         else
         {
@@ -260,7 +389,19 @@ HMODULE LibraryLoadHooks::LoadLibraryCheckW(std::wstring libName, LPCWSTR lpLibF
 
         if (commonModule != nullptr)
         {
-            StreamlineHooks::hookCommon(commonModule);
+            MarkNativeStreamlineModule(std::filesystem::path(lpLibFullPath != nullptr ? lpLibFullPath : libName.c_str()),
+                                       "sl.common");
+
+            if (!DLSSGNative::ShouldSkipStreamlinePluginHooks())
+            {
+                // Needed for systemCaps hwsSupported spoofing and architecture spoofing
+                // in OptiScaler-owned DLSSG output mode.
+                StreamlineHooks::hookCommon(commonModule);
+            }
+            else
+            {
+                LOG_DEBUG("Skipping StreamlineHooks::hookCommon - native DLSSG mode active");
+            }
         }
         else
         {
@@ -908,20 +1049,27 @@ HMODULE LibraryLoadHooks::LoadNvngxDlss(std::wstring originalPath)
 
 void LibraryLoadHooks::CheckModulesInMemory()
 {
+    // When OptiScaler owns DLSSG output: skip game Streamline interposer/dlss/reflex/pcl hooks, but allow
+    // dlssg+common hooks for JSON/caps patching. Native DLSSG attach/passthrough skips plugin hooks entirely.
+    bool skipSLHooks = (State::Instance().activeFgOutput == FGOutput::DLSSG);
+
     if (!StreamlineHooks::isInterposerHooked())
     {
-        // hook streamline right away if it's already loaded
         HMODULE slModule = nullptr;
         slModule = GetDllNameWModule(&slInterposerNamesW);
         if (slModule != nullptr)
         {
             LOG_DEBUG("sl.interposer.dll already in memory");
-            StreamlineHooks::hookInterposer(slModule);
+            MarkNativeStreamlineModule(slModule, "sl.interposer");
+            if (!skipSLHooks || DLSSGNative::ShouldHookNativeInterposer())
+                StreamlineHooks::hookInterposer(slModule);
+            else
+                LOG_DEBUG("Skipping StreamlineHooks::hookInterposer - DLSSG output active");
             slInterposerModule = slModule;
         }
     }
 
-    if (!StreamlineHooks::isDlssHooked())
+    if (!skipSLHooks && !StreamlineHooks::isDlssHooked())
     {
         HMODULE slDlss = nullptr;
         slDlss = GetDllNameWModule(&slDlssNamesW);
@@ -939,11 +1087,15 @@ void LibraryLoadHooks::CheckModulesInMemory()
         if (slDlssg != nullptr)
         {
             LOG_DEBUG("sl.dlss_g.dll already in memory");
-            StreamlineHooks::hookDlssg(slDlssg);
+            MarkNativeStreamlineModule(slDlssg, "sl.dlss_g");
+            if (!DLSSGNative::ShouldSkipStreamlinePluginHooks())
+                StreamlineHooks::hookDlssg(slDlssg);
+            else
+                LOG_DEBUG("Skipping StreamlineHooks::hookDlssg - native DLSSG mode active");
         }
     }
 
-    if (!StreamlineHooks::isReflexHooked())
+    if (!skipSLHooks && !StreamlineHooks::isReflexHooked())
     {
         HMODULE slReflex = nullptr;
         slReflex = GetDllNameWModule(&slReflexNamesW);
@@ -954,7 +1106,7 @@ void LibraryLoadHooks::CheckModulesInMemory()
         }
     }
 
-    if (!StreamlineHooks::isPclHooked())
+    if (!skipSLHooks && !StreamlineHooks::isPclHooked())
     {
         HMODULE slPcl = nullptr;
         slPcl = GetDllNameWModule(&slPclNamesW);
@@ -972,7 +1124,11 @@ void LibraryLoadHooks::CheckModulesInMemory()
         if (slCommon != nullptr)
         {
             LOG_DEBUG("sl.common.dll already in memory");
-            StreamlineHooks::hookCommon(slCommon);
+            MarkNativeStreamlineModule(slCommon, "sl.common");
+            if (!DLSSGNative::ShouldSkipStreamlinePluginHooks())
+                StreamlineHooks::hookCommon(slCommon);
+            else
+                LOG_DEBUG("Skipping StreamlineHooks::hookCommon - native DLSSG mode active");
         }
     }
 

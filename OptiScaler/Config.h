@@ -545,6 +545,11 @@ class Config
     CustomOptional<bool> FGXeFGDebugView { false };
     CustomOptional<bool> FGXeFGForceBorderless { false };
 
+    // DLSS-G Output
+    CustomOptional<int> FGDLSSGInterpolationCount { 1 };
+    CustomOptional<bool> FGDLSSGLatewarpFeatureProbe { false };
+    CustomOptional<DLSSGNativeMode> FGDLSSGNativeMode { DLSSGNativeMode::Auto };
+
     // fakenvapi
     CustomOptional<bool> FN_EnableLogs { true };
     CustomOptional<bool> FN_EnableTraceLogs { false };
@@ -569,6 +574,45 @@ class Config
 
     // Framerate
     CustomOptional<float> FramerateLimit { 0.0f };
+
+    // Low Latency: 0=Auto, 1=Reflex, 2=Anti-Lag 2, 3=XeLL, 4=LatencyFlex, 5=Off
+    CustomOptional<uint32_t> LatencyReductionMethod { 0 };
+
+    // Frame Warp (mouse-driven late warp)
+    CustomOptional<bool> FrameWarpEnabled { false };
+    CustomOptional<float> FrameWarpStrength { 1.0f };
+    CustomOptional<bool> FrameWarpAutoCalibration { true };
+    CustomOptional<float> FrameWarpSensitivity { 0.0005f }; // Manual fallback: raw mouse counts to radians
+    CustomOptional<bool> FrameWarpInputPrediction { false };
+    // FrameWarpLatencyRatio removed - mouse-based warp uses actual input delta
+    CustomOptional<bool> FrameWarpDepthAware { false };
+    CustomOptional<float> FrameWarpMaxAngle { 4.0f }; // degrees
+    CustomOptional<bool> FrameWarpWithFG { true }; // Allow warp with FG active (v1: FSRFG-only, default true)
+    CustomOptional<bool> FrameWarpComparisonLog { false };
+    CustomOptional<bool> FrameWarpPacingLog { false };
+    CustomOptional<bool> FrameWarpTimingAuditLog { false };
+    CustomOptional<uint32_t> FrameWarpDLSSGMode { 0 }; // 0=off, 1=telemetry only, 2=DLSSG distortion field, 3=late-present warp, 4=experimental resource-copy warp
+    CustomOptional<uint32_t> FrameWarpDLSSGLatePresentTestMode { 0 }; // 0=live, 1=no submit, 2=identity submit, 3=live no stable UI, 4=identity no stable UI
+    CustomOptional<uint32_t> FrameWarpDLSSGPhaseMode { 0 }; // 0=safe default, 1=snapshot changed only, 2=snapshot unchanged proof gate, 3=alternate presents, 4=SL presented-count heuristic
+    CustomOptional<bool> FrameWarpDLSSGUnsafeLiveWarp { false }; // Diagnostic: restore raw live late-present warp on snapshot-change presents
+    CustomOptional<uint32_t> FrameWarpPresentParamMode { 0 }; // 0=current, 1=original, 2=empty, 3=full-frame dirty rect
+    CustomOptional<float> FrameWarpMinPixelShift { 0.0f }; // Optional diagnostic significance gate; 0 disables
+    CustomOptional<bool> FrameWarpSensitivityAuditLog { false };
+    CustomOptional<bool> FrameWarpDebug { false }; // Show debug overlay
+    // 0=Auto, 1=GetRawInputData only, 2=GetRawInputBuffer only, 3=Subclass only
+    CustomOptional<uint32_t> FrameWarpRawInputSourceMode { 0 };
+	enum FrameWarpDebugView : uint32_t
+	{
+		FrameWarpDebugView_Off = 0,
+		FrameWarpDebugView_Overlay = 1, // Text overlay with yaw/pitch/skip reason
+		FrameWarpDebugView_Mask = 2,    // Full-screen displacement mask visualization
+		FrameWarpDebugView_COUNT,
+	};
+	CustomOptional<uint32_t> FrameWarpDebugViewMode { FrameWarpDebugView_Off };
+    // 0=Normal, 1=CopyBoth, 2=WarpGeneratedOnly, 3=WarpRealOnly,
+    // 4=WarpBothSameDelta, 5=AutoCycle diagnostics
+    CustomOptional<uint32_t> FrameWarpFGDiagnosticMode { 0 };
+    CustomOptional<uint32_t> FrameWarpFGDiagnosticCycleFrames { 240 };
 
     // HDR
     CustomOptional<bool> ForceHDR { false };

@@ -65,6 +65,11 @@ bool Config::Reload(std::filesystem::path iniPath)
 
         // Frame Generation
         {
+            {
+                // Diagnostic: read the raw value from SimpleIni to debug FGEnabled loading
+                const char* rawEnabled = ini.GetValue("FrameGen", "Enabled", nullptr);
+                _log.push_back(std::format("FrameGen.Enabled(raw): {}", rawEnabled ? rawEnabled : "(null/missing)"));
+            }
             FGEnabled.set_from_config(readBool("FrameGen", "Enabled"));
             FGDebugView.set_from_config(readBool("FrameGen", "DebugView"));
 
@@ -98,6 +103,8 @@ bool Config::Reload(std::filesystem::path iniPath)
                     FGOutput.set_from_config(FGOutput::Nukems);
                 else if (lstrcmpiA(FGOutputString.value().c_str(), "xefg") == 0)
                     FGOutput.set_from_config(FGOutput::XeFG);
+                else if (lstrcmpiA(FGOutputString.value().c_str(), "dlssg") == 0)
+                    FGOutput.set_from_config(FGOutput::DLSSG);
             }
 
             auto ftInput = readInt("FrameGen", "FTSource");
@@ -145,6 +152,52 @@ bool Config::Reload(std::filesystem::path iniPath)
             FGFPTHybridSpinTime.set_from_config(readInt("FSRFG", "FPTHybridSpinTime"));
             FGFPTAllowWaitForSingleObjectOnFence.set_from_config(readBool("FSRFG", "FPTWaitForSingleObjectOnFence"));
             FSRFGEnableWatermark.set_from_config(readBool("FSRFG", "EnableWatermark"));
+        }
+
+        // Frame Warp
+        {
+            FrameWarpEnabled.set_from_config(readBool("FrameWarp", "Enabled"));
+            FrameWarpStrength.set_from_config(readFloat("FrameWarp", "Strength"));
+            FrameWarpAutoCalibration.set_from_config(readBool("FrameWarp", "AutoCalibration"));
+            FrameWarpDepthAware.set_from_config(readBool("FrameWarp", "DepthAware"));
+            FrameWarpMaxAngle.set_from_config(readFloat("FrameWarp", "MaxAngle"));
+            FrameWarpWithFG.set_from_config(readBool("FrameWarp", "WithFG"));
+            FrameWarpComparisonLog.set_from_config(readBool("FrameWarp", "ComparisonLog"));
+            FrameWarpPacingLog.set_from_config(readBool("FrameWarp", "PacingLog"));
+            FrameWarpTimingAuditLog.set_from_config(readBool("FrameWarp", "TimingAuditLog"));
+            FrameWarpDLSSGMode.set_from_config(readUInt("FrameWarp", "DLSSGMode"));
+            if (FrameWarpDLSSGMode.has_value() && FrameWarpDLSSGMode.value() > 4)
+                FrameWarpDLSSGMode.reset();
+            FrameWarpDLSSGLatePresentTestMode.set_from_config(readUInt("FrameWarp", "DLSSGLatePresentTestMode"));
+            if (FrameWarpDLSSGLatePresentTestMode.has_value() && FrameWarpDLSSGLatePresentTestMode.value() > 4)
+                FrameWarpDLSSGLatePresentTestMode.reset();
+            FrameWarpDLSSGPhaseMode.set_from_config(readUInt("FrameWarp", "DLSSGPhaseMode"));
+            if (FrameWarpDLSSGPhaseMode.has_value() && FrameWarpDLSSGPhaseMode.value() > 4)
+                FrameWarpDLSSGPhaseMode.reset();
+            FrameWarpDLSSGUnsafeLiveWarp.set_from_config(readBool("FrameWarp", "DLSSGUnsafeLiveWarp"));
+            FrameWarpPresentParamMode.set_from_config(readUInt("FrameWarp", "PresentParamMode"));
+            if (FrameWarpPresentParamMode.has_value() && FrameWarpPresentParamMode.value() > 3)
+                FrameWarpPresentParamMode.reset();
+            FrameWarpMinPixelShift.set_from_config(readFloat("FrameWarp", "MinPixelShift"));
+            FrameWarpSensitivityAuditLog.set_from_config(readBool("FrameWarp", "SensitivityAuditLog"));
+            FrameWarpDebug.set_from_config(readBool("FrameWarp", "Debug"));
+            FrameWarpSensitivity.set_from_config(readFloat("FrameWarp", "Sensitivity"));
+            FrameWarpInputPrediction.set_from_config(readBool("FrameWarp", "InputPrediction"));
+            FrameWarpRawInputSourceMode.set_from_config(readUInt("FrameWarp", "RawInputSourceMode"));
+            FrameWarpDebugViewMode.set_from_config(readUInt("FrameWarp", "DebugViewMode"));
+            FrameWarpFGDiagnosticMode.set_from_config(readUInt("FrameWarp", "FGDiagnosticMode"));
+            FrameWarpFGDiagnosticCycleFrames.set_from_config(readUInt("FrameWarp", "FGDiagnosticCycleFrames"));
+
+            // These defaults are important for remote VibeFlex/DLSSG diagnosis,
+            // so log the resolved values even when the INI leaves them as auto.
+            _log.push_back(std::format("FrameWarp.Enabled(resolved): {}",
+                FrameWarpEnabled.value_or_default() ? "true" : "false"));
+            _log.push_back(std::format("FrameWarp.WithFG(resolved): {}",
+                FrameWarpWithFG.value_or_default() ? "true" : "false"));
+            _log.push_back(std::format("FrameWarp.TimingAuditLog(resolved): {}",
+                FrameWarpTimingAuditLog.value_or_default() ? "true" : "false"));
+            _log.push_back(std::format("FrameWarp.DLSSGUnsafeLiveWarp(resolved): {}",
+                FrameWarpDLSSGUnsafeLiveWarp.value_or_default() ? "true" : "false"));
         }
 
         // OptiFG
@@ -196,6 +249,26 @@ bool Config::Reload(std::filesystem::path iniPath)
             FGXeFGForceBorderless.set_from_config(readBool("XeFG", "ForceBorderless"));
         }
 
+        // DLSS-G Output
+        {
+            FGDLSSGInterpolationCount.set_from_config(readInt("DLSSG", "InterpolationCount"));
+            if (FGDLSSGInterpolationCount.has_value() &&
+                (FGDLSSGInterpolationCount.value() < 1 || FGDLSSGInterpolationCount.value() > 3))
+                FGDLSSGInterpolationCount.reset();
+            FGDLSSGLatewarpFeatureProbe.set_from_config(readBool("DLSSG", "LatewarpFeatureProbe"));
+            if (auto nativeMode = readString("DLSSG", "NativeMode"); nativeMode.has_value())
+            {
+                if (lstrcmpiA(nativeMode.value().c_str(), "auto") == 0)
+                    FGDLSSGNativeMode.set_from_config(DLSSGNativeMode::Auto);
+                else if (lstrcmpiA(nativeMode.value().c_str(), "legacy") == 0)
+                    FGDLSSGNativeMode.set_from_config(DLSSGNativeMode::Legacy);
+                else if (lstrcmpiA(nativeMode.value().c_str(), "attach") == 0)
+                    FGDLSSGNativeMode.set_from_config(DLSSGNativeMode::Attach);
+                else if (lstrcmpiA(nativeMode.value().c_str(), "passthrough") == 0)
+                    FGDLSSGNativeMode.set_from_config(DLSSGNativeMode::Passthrough);
+            }
+        }
+
         // FSR FG Inputs
         {
             FSRFGSkipConfigForHudless.set_from_config(readBool("FSRFGInputs", "SkipConfigForHudless"));
@@ -205,6 +278,7 @@ bool Config::Reload(std::filesystem::path iniPath)
         // Framerate
         {
             FramerateLimit.set_from_config(readFloat("Framerate", "FramerateLimit"));
+            LatencyReductionMethod.set_from_config(readUInt("Framerate", "LatencyMethod"));
         }
 
         // FSR Common
@@ -617,7 +691,8 @@ bool Config::Reload(std::filesystem::path iniPath)
             if (!SpoofHAGS.has_value())
             {
                 SpoofHAGS.set_volatile_value(FGInput.value_or_default() == FGInput::Nukems ||
-                                             FGInput.value_or_default() == FGInput::DLSSG);
+                                             FGInput.value_or_default() == FGInput::DLSSG ||
+                                             FGOutput.value_or_default() == FGOutput::DLSSG);
             }
         }
 
@@ -680,8 +755,8 @@ bool Config::Reload(std::filesystem::path iniPath)
             FfxVkPath.set_from_config(readWString("Libraries", "FfxVkPath"));
 
             XeSSLibrary.set_from_config(readWString("Libraries", "XeSSPath"));
-            XeSSLibrary.set_from_config(readWString("Libraries", "XeFGPath"));
-            XeSSLibrary.set_from_config(readWString("Libraries", "XeLLPath"));
+            XeFGLibrary.set_from_config(readWString("Libraries", "XeFGPath"));
+            XeLLLibrary.set_from_config(readWString("Libraries", "XeLLPath"));
             XeSSDx11Library.set_from_config(readWString("Libraries", "XeSSDx11Path"));
         }
 
@@ -743,6 +818,21 @@ std::string GetFloatValue(std::optional<float> value)
     return std::to_string(value.value());
 }
 
+std::string GetDLSSGNativeModeValue(std::optional<DLSSGNativeMode> value)
+{
+    if (!value.has_value())
+        return "auto";
+
+    switch (value.value())
+    {
+    case DLSSGNativeMode::Auto: return "auto";
+    case DLSSGNativeMode::Legacy: return "legacy";
+    case DLSSGNativeMode::Attach: return "attach";
+    case DLSSGNativeMode::Passthrough: return "passthrough";
+    default: return "auto";
+    }
+}
+
 bool Config::SaveIni()
 {
     // Upscalers
@@ -785,6 +875,8 @@ bool Config::SaveIni()
                 FGOutputString = "Nukems";
             else if (FGOutputHeld.value() == FGOutput::XeFG)
                 FGOutputString = "XeFG";
+            else if (FGOutputHeld.value() == FGOutput::DLSSG)
+                FGOutputString = "DLSSG";
         }
         ini.SetValue("FrameGen", "FGOutput", FGOutputString.c_str());
 
@@ -844,10 +936,35 @@ bool Config::SaveIni()
                      GetIntValue(Instance()->FGFPTHybridSpinTime.value_for_config()).c_str());
         ini.SetValue("FSRFG", "FPTWaitForSingleObjectOnFence",
                      GetBoolValue(Instance()->FGFPTAllowWaitForSingleObjectOnFence.value_for_config()).c_str());
-        ini.SetValue("FSRFG", "EnableWatermark",
-                     GetBoolValue(Instance()->FSRFGEnableWatermark.value_for_config()).c_str());
+        ini.SetValue("FSRFG", "EnableWatermark", GetBoolValue(Instance()->FSRFGEnableWatermark.value_for_config()).c_str());
     }
 
+    // Frame Warp
+    {
+        ini.SetValue("FrameWarp", "Enabled", GetBoolValue(Instance()->FrameWarpEnabled.value_for_config()).c_str());
+        ini.SetValue("FrameWarp", "Strength", GetFloatValue(Instance()->FrameWarpStrength.value_for_config()).c_str());
+        ini.SetValue("FrameWarp", "AutoCalibration", GetBoolValue(Instance()->FrameWarpAutoCalibration.value_for_config()).c_str());
+        ini.SetValue("FrameWarp", "DepthAware", GetBoolValue(Instance()->FrameWarpDepthAware.value_for_config()).c_str());
+        ini.SetValue("FrameWarp", "MaxAngle", GetFloatValue(Instance()->FrameWarpMaxAngle.value_for_config()).c_str());
+        ini.SetValue("FrameWarp", "WithFG", GetBoolValue(Instance()->FrameWarpWithFG.value_for_config()).c_str());
+        ini.SetValue("FrameWarp", "ComparisonLog", GetBoolValue(Instance()->FrameWarpComparisonLog.value_for_config()).c_str());
+        ini.SetValue("FrameWarp", "PacingLog", GetBoolValue(Instance()->FrameWarpPacingLog.value_for_config()).c_str());
+        ini.SetValue("FrameWarp", "TimingAuditLog", GetBoolValue(Instance()->FrameWarpTimingAuditLog.value_for_config()).c_str());
+        ini.SetValue("FrameWarp", "DLSSGMode", GetIntValue(Instance()->FrameWarpDLSSGMode.value_for_config()).c_str());
+        ini.SetValue("FrameWarp", "DLSSGLatePresentTestMode", GetIntValue(Instance()->FrameWarpDLSSGLatePresentTestMode.value_for_config()).c_str());
+        ini.SetValue("FrameWarp", "DLSSGPhaseMode", GetIntValue(Instance()->FrameWarpDLSSGPhaseMode.value_for_config()).c_str());
+        ini.SetValue("FrameWarp", "DLSSGUnsafeLiveWarp", GetBoolValue(Instance()->FrameWarpDLSSGUnsafeLiveWarp.value_for_config()).c_str());
+        ini.SetValue("FrameWarp", "PresentParamMode", GetIntValue(Instance()->FrameWarpPresentParamMode.value_for_config()).c_str());
+        ini.SetValue("FrameWarp", "MinPixelShift", GetFloatValue(Instance()->FrameWarpMinPixelShift.value_for_config()).c_str());
+        ini.SetValue("FrameWarp", "SensitivityAuditLog", GetBoolValue(Instance()->FrameWarpSensitivityAuditLog.value_for_config()).c_str());
+        ini.SetValue("FrameWarp", "Debug", GetBoolValue(Instance()->FrameWarpDebug.value_for_config()).c_str());
+        ini.SetValue("FrameWarp", "Sensitivity", GetFloatValue(Instance()->FrameWarpSensitivity.value_for_config()).c_str());
+        ini.SetValue("FrameWarp", "InputPrediction", GetBoolValue(Instance()->FrameWarpInputPrediction.value_for_config()).c_str());
+        ini.SetValue("FrameWarp", "RawInputSourceMode", GetIntValue(Instance()->FrameWarpRawInputSourceMode.value_for_config()).c_str());
+        ini.SetValue("FrameWarp", "DebugViewMode", GetIntValue(Instance()->FrameWarpDebugViewMode.value_for_config()).c_str());
+        ini.SetValue("FrameWarp", "FGDiagnosticMode", GetIntValue(Instance()->FrameWarpFGDiagnosticMode.value_for_config()).c_str());
+        ini.SetValue("FrameWarp", "FGDiagnosticCycleFrames", GetIntValue(Instance()->FrameWarpFGDiagnosticCycleFrames.value_for_config()).c_str());
+    }
     // XeFG output
     {
         ini.SetValue("XeFG", "InterpolationCount",
@@ -861,6 +978,16 @@ bool Config::SaveIni()
         ini.SetValue("XeFG", "DebugView", GetBoolValue(Instance()->FGXeFGDebugView.value_for_config()).c_str());
         ini.SetValue("XeFG", "ForceBorderless",
                      GetBoolValue(Instance()->FGXeFGForceBorderless.value_for_config()).c_str());
+    }
+
+    // DLSS-G Output
+    {
+        ini.SetValue("DLSSG", "InterpolationCount",
+                     GetIntValue(Instance()->FGDLSSGInterpolationCount.value_for_config()).c_str());
+        ini.SetValue("DLSSG", "LatewarpFeatureProbe",
+                     GetBoolValue(Instance()->FGDLSSGLatewarpFeatureProbe.value_for_config()).c_str());
+        ini.SetValue("DLSSG", "NativeMode",
+                     GetDLSSGNativeModeValue(Instance()->FGDLSSGNativeMode.value_for_config()).c_str());
     }
 
     // OptiFG
@@ -926,6 +1053,11 @@ bool Config::SaveIni()
     {
         ini.SetValue("Framerate", "FramerateLimit",
                      GetFloatValue(Instance()->FramerateLimit.value_for_config()).c_str());
+        {
+            auto val = Instance()->LatencyReductionMethod.value_for_config();
+            std::optional<int> intVal = val.has_value() ? std::optional<int>((int) val.value()) : std::nullopt;
+            ini.SetValue("Framerate", "LatencyMethod", GetIntValue(intVal).c_str());
+        }
     }
 
     // Output Scaling

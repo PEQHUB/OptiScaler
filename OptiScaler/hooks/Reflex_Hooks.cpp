@@ -15,6 +15,42 @@ NvAPI_Status ReflexHooks::hkNvAPI_D3D_SetSleepMode(IUnknown* pDev, NV_SET_SLEEP_
 #ifdef LOG_REFLEX_CALLS
     LOG_FUNC();
 #endif
+
+    // Lazy init of native low latency backend — use State's already-captured D3D12 device
+    if (!_nativeLatencyInitialized)
+    {
+        auto* device12 = State::Instance().currentD3D12Device;
+        // DX11 FG proxy mode: game is DX11-only but we have a hidden DX12 device for FG
+        if (!device12 && State::Instance().dx11FGMode)
+            device12 = State::Instance().dx12DeviceForDx11FG;
+        ID3D12Device* qiDevice = nullptr;
+        if (!device12 && pDev)
+        {
+            // Fallback: try QI from the game's device parameter
+            if (SUCCEEDED(pDev->QueryInterface(IID_PPV_ARGS(&qiDevice))) && qiDevice)
+                device12 = qiDevice;
+        }
+        if (device12)
+        {
+            _nativeLatencyInitialized = true;
+            LOG_INFO("NativeLowLatency: Initializing from SetSleepMode, device: {:X}", (size_t)device12);
+            NativeLowLatency::Initialize(device12, Config::Instance()->LatencyReductionMethod.value_or_default());
+        }
+        else
+        {
+            LOG_DEBUG("NativeLowLatency: No D3D12 device available yet, will retry");
+        }
+        // Release QI ref after Initialize completes (game still holds its own refs)
+        if (qiDevice)
+            qiDevice->Release();
+    }
+
+    // DX11 FG mode: route Reflex to the hidden DX12 device for GPU-synced pacing.
+    // The game passes its DX11 device, but NVIDIA Reflex needs a DX12 device with
+    // actual GPU work (copy + FG dispatch) to calculate proper sleep timing.
+    if (State::Instance().dx11FGMode && State::Instance().dx12DeviceForDx11FG)
+        pDev = State::Instance().dx12DeviceForDx11FG;
+
     // Store for later so we can adjust the fps whenever we want
     memcpy(&_lastSleepParams, pSetSleepModeParams, sizeof(NV_SET_SLEEP_MODE_PARAMS));
     _lastSleepDev = pDev;
@@ -25,7 +61,12 @@ NvAPI_Status ReflexHooks::hkNvAPI_D3D_SetSleepMode(IUnknown* pDev, NV_SET_SLEEP_
     if (_minimumIntervalUs != 0)
         pSetSleepModeParams->minimumIntervalUs = _minimumIntervalUs;
 
-    if (State::Instance().activeFgOutput == FGOutput::XeFG && fakenvapi::ForNvidia_SetSleepMode)
+    // Native backend takes priority
+    if (NativeLowLatency::IsAvailable())
+        return NativeLowLatency::SetSleepMode(pDev, pSetSleepModeParams);
+
+    if ((State::Instance().activeFgOutput == FGOutput::XeFG || State::Instance().activeFgOutput == FGOutput::DLSSG) &&
+        fakenvapi::ForNvidia_SetSleepMode)
         return fakenvapi::ForNvidia_SetSleepMode(pDev, pSetSleepModeParams);
     else
         return o_NvAPI_D3D_SetSleepMode(pDev, pSetSleepModeParams);
@@ -37,7 +78,32 @@ NvAPI_Status ReflexHooks::hkNvAPI_D3D_Sleep(IUnknown* pDev)
     LOG_FUNC();
 #endif
 
-    if (State::Instance().activeFgOutput == FGOutput::XeFG && fakenvapi::ForNvidia_Sleep)
+    // Fallback init trigger in case SetSleepMode was never called
+    if (!_nativeLatencyInitialized)
+    {
+        auto* device12 = State::Instance().currentD3D12Device;
+        // DX11 FG proxy mode: game is DX11-only but we have a hidden DX12 device for FG
+        if (!device12 && State::Instance().dx11FGMode)
+            device12 = State::Instance().dx12DeviceForDx11FG;
+        if (device12)
+        {
+            _nativeLatencyInitialized = true;
+            LOG_INFO("NativeLowLatency: Initializing from Sleep, device: {:X}", (size_t)device12);
+            NativeLowLatency::Initialize(device12, Config::Instance()->LatencyReductionMethod.value_or_default());
+        }
+    }
+
+    // DX11 FG mode: route Reflex Sleep to the hidden DX12 device.
+    // o_NvAPI_D3D_Sleep will block based on this device's GPU timeline.
+    if (State::Instance().dx11FGMode && State::Instance().dx12DeviceForDx11FG)
+        pDev = State::Instance().dx12DeviceForDx11FG;
+
+    // Native backend takes priority
+    if (NativeLowLatency::IsAvailable())
+        return NativeLowLatency::Sleep(pDev);
+
+    if ((State::Instance().activeFgOutput == FGOutput::XeFG || State::Instance().activeFgOutput == FGOutput::DLSSG) &&
+        fakenvapi::ForNvidia_Sleep)
         return fakenvapi::ForNvidia_Sleep(pDev);
     else
         return o_NvAPI_D3D_Sleep(pDev);
@@ -49,7 +115,12 @@ NvAPI_Status ReflexHooks::hkNvAPI_D3D_GetLatency(IUnknown* pDev, NV_LATENCY_RESU
     LOG_FUNC();
 #endif
 
-    if (State::Instance().activeFgOutput == FGOutput::XeFG && fakenvapi::ForNvidia_GetLatency)
+    // Native backend takes priority
+    if (NativeLowLatency::IsAvailable())
+        return NativeLowLatency::GetLatency(pDev, pGetLatencyParams);
+
+    if ((State::Instance().activeFgOutput == FGOutput::XeFG || State::Instance().activeFgOutput == FGOutput::DLSSG) &&
+        fakenvapi::ForNvidia_GetLatency)
         return fakenvapi::ForNvidia_GetLatency(pDev, pGetLatencyParams);
     else
         return o_NvAPI_D3D_GetLatency(pDev, pGetLatencyParams);
@@ -61,6 +132,22 @@ NvAPI_Status ReflexHooks::hkNvAPI_D3D_SetLatencyMarker(IUnknown* pDev,
 #ifdef LOG_REFLEX_CALLS
     LOG_FUNC();
 #endif
+
+    // Fallback init trigger in case SetSleepMode/Sleep were never called
+    if (!_nativeLatencyInitialized)
+    {
+        auto* device12 = State::Instance().currentD3D12Device;
+        // DX11 FG proxy mode: game is DX11-only but we have a hidden DX12 device for FG
+        if (!device12 && State::Instance().dx11FGMode)
+            device12 = State::Instance().dx12DeviceForDx11FG;
+        if (device12)
+        {
+            _nativeLatencyInitialized = true;
+            LOG_INFO("NativeLowLatency: Initializing from SetLatencyMarker, device: {:X}", (size_t)device12);
+            NativeLowLatency::Initialize(device12, Config::Instance()->LatencyReductionMethod.value_or_default());
+        }
+    }
+
     _updatesWithoutMarker = 0;
 
     // LOG_DEBUG("frameID: {}, markerType: {}", pSetLatencyMarkerParams->frameID,
@@ -128,7 +215,21 @@ NvAPI_Status ReflexHooks::hkNvAPI_D3D_SetLatencyMarker(IUnknown* pDev,
     if (pSetLatencyMarkerParams->markerType == PRESENT_START && State::Instance().activeFgInput == FGInput::DLSSG)
         State::Instance().slFGInputs.markPresent(pSetLatencyMarkerParams->frameID);
 
-    if (State::Instance().activeFgOutput == FGOutput::XeFG && fakenvapi::ForNvidia_SetLatencyMarker)
+    // DX11 FG mode: route latency markers to the hidden DX12 device so the driver
+    // can correlate PCL markers (SimStart, RenderSubmit, Present) with GPU work.
+    // Must be AFTER the evaluateState/markPresent blocks above — those blocks use
+    // QueryInterface for ID3D12Device to decide whether to call evaluateState.
+    // With the DX11 game device, QI fails → evaluateState skipped (correct for
+    // DX11 FG proxy which manages FG inputs through shared textures).
+    if (State::Instance().dx11FGMode && State::Instance().dx12DeviceForDx11FG)
+        pDev = State::Instance().dx12DeviceForDx11FG;
+
+    // Native backend takes priority
+    if (NativeLowLatency::IsAvailable())
+        return NativeLowLatency::SetLatencyMarker(pDev, pSetLatencyMarkerParams);
+
+    if ((State::Instance().activeFgOutput == FGOutput::XeFG || State::Instance().activeFgOutput == FGOutput::DLSSG) &&
+        fakenvapi::ForNvidia_SetLatencyMarker)
         return fakenvapi::ForNvidia_SetLatencyMarker(pDev, pSetLatencyMarkerParams);
     else
         return o_NvAPI_D3D_SetLatencyMarker(pDev, pSetLatencyMarkerParams);
@@ -175,7 +276,8 @@ NvAPI_Status ReflexHooks::hkNvAPI_D3D12_SetAsyncFrameMarker(ID3D12CommandQueue* 
         }
     }
 
-    if (State::Instance().activeFgOutput == FGOutput::XeFG && fakenvapi::ForNvidia_SetAsyncFrameMarker)
+    if ((State::Instance().activeFgOutput == FGOutput::XeFG || State::Instance().activeFgOutput == FGOutput::DLSSG) &&
+        fakenvapi::ForNvidia_SetAsyncFrameMarker)
         return fakenvapi::ForNvidia_SetAsyncFrameMarker(pCommandQueue, pSetAsyncFrameMarkerParams);
     else
         return o_NvAPI_D3D12_SetAsyncFrameMarker(pCommandQueue, pSetAsyncFrameMarkerParams);
@@ -287,7 +389,10 @@ void* ReflexHooks::getHookedReflex(unsigned int InterfaceId)
 
 bool ReflexHooks::updateTimingData()
 {
-    bool canCall = ((State::Instance().activeFgOutput == FGOutput::XeFG && fakenvapi::ForNvidia_GetLatency) ||
+    bool canCall = NativeLowLatency::IsAvailable() ||
+                   (((State::Instance().activeFgOutput == FGOutput::XeFG ||
+                      State::Instance().activeFgOutput == FGOutput::DLSSG) &&
+                     fakenvapi::ForNvidia_GetLatency) ||
                     o_NvAPI_D3D_GetLatency);
 
     if (!canCall || !_lastSleepDev)
@@ -345,6 +450,25 @@ void ReflexHooks::update(bool optiFg_FgState, bool isVulkan)
 
     State::Instance().reflexShowWarning = false;
 
+    // Native backend always provides FPS limiting
+    if (NativeLowLatency::IsAvailable())
+    {
+        State::Instance().reflexLimitsFps = true;
+        // Still need to update FPS limit when it changes
+        float currentFps = Config::Instance()->FramerateLimit.value_or_default();
+        static float lastNativeFps = 0;
+
+        if (optiFg_FgState || _dlssgDetected)
+            currentFps /= 2;
+
+        if (currentFps != lastNativeFps)
+        {
+            setFPSLimit(currentFps);
+            lastNativeFps = currentFps;
+        }
+        return;
+    }
+
     if (_updatesWithoutMarker > 20 || !_inited)
     {
         State::Instance().reflexLimitsFps = false;
@@ -356,6 +480,16 @@ void ReflexHooks::update(bool optiFg_FgState, bool isVulkan)
         // optiFg_FgState doesn't matter for vulkan
         // isUsingFakenvapi() because fakenvapi might override the reflex' setting and we don't know it
         State::Instance().reflexLimitsFps = fakenvapi::isUsingFakenvapi() || _lastVkSleepParams.bLowLatencyMode;
+    }
+    else if (State::Instance().activeFgOutput == FGOutput::DLSSG)
+    {
+        // DLSSG uses SL's native slReflexSleep for frame pacing — skip software limiter.
+        // Return early: Streamline manages its own Reflex configuration internally.
+        // Falling through to setFPSLimit() would call o_NvAPI_D3D_SetSleepMode with
+        // minimumIntervalUs=0, constantly overriding Streamline's Reflex config and
+        // disrupting frame pacing (6000+ spurious calls per session).
+        State::Instance().reflexLimitsFps = true;
+        return;
     }
     else
     {
@@ -426,6 +560,13 @@ void ReflexHooks::setFPSLimit(float fps)
         _minimumIntervalUs = 0;
     else
         _minimumIntervalUs = static_cast<uint32_t>(std::round(1'000'000 / fps));
+
+    // Native backend handles FPS cap directly
+    if (NativeLowLatency::IsAvailable())
+    {
+        NativeLowLatency::SetFPSCap(fps);
+        return;
+    }
 
     if (_lastSleepDev != nullptr)
     {

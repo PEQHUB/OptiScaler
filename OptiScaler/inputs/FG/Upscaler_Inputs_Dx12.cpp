@@ -2,10 +2,21 @@
 #include "Upscaler_Inputs_Dx12.h"
 #include <hudfix/Hudfix_Dx12.h>
 #include <resource_tracking/ResTrack_dx12.h>
+#include <framewarp/FrameWarp.h>
 
 #include "shaders/depth_scale/DS_Dx12.h"
 
 static DS_Dx12* DepthScale = nullptr;
+
+static bool ShouldCaptureVibeFlexDepth()
+{
+    auto config = Config::Instance();
+    return config != nullptr &&
+           config->FrameWarpEnabled.value_or_default() &&
+           config->FrameWarpDepthAware.value_or_default() &&
+           config->FrameWarpDLSSGMode.value_or_default() == 3 &&
+           State::Instance().activeFgOutput == FGOutput::DLSSG;
+}
 
 void UpscalerInputsDx12::Init(ID3D12Device* device)
 {
@@ -83,7 +94,38 @@ void UpscalerInputsDx12::UpscaleStart(ID3D12GraphicsCommandList* InCmdList, NVSD
     State::Instance().lastFsrCameraFar = cameraFar;
     State::Instance().lastFsrCameraNear = cameraNear;
 
+    auto aspectRatio = (float) feature->DisplayWidth() / (float) feature->DisplayHeight();
+
+    if (Config::Instance()->FrameWarpEnabled.value_or_default() && _device != nullptr)
+    {
+        DXGI_FORMAT frameWarpFormat = State::Instance().currentSwapchainDesc.BufferDesc.Format;
+        if (frameWarpFormat == DXGI_FORMAT_UNKNOWN)
+            frameWarpFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+
+        if (FrameWarpRuntime::EnsureInitialized(
+                _device,
+                static_cast<UINT>(feature->DisplayWidth()),
+                static_cast<UINT>(feature->DisplayHeight()),
+                frameWarpFormat))
+        {
+            FrameWarpRuntime::MarkFrameRenderStart("upscale", cameraVFov, aspectRatio);
+        }
+    }
+
     auto fg = State::Instance().currentFG;
+    const bool fgUpscalerReady = fg != nullptr && State::Instance().activeFgInput == FGInput::Upscaler &&
+        _device != nullptr;
+    const bool fgActive = fgUpscalerReady && fg->IsActive() &&
+        Config::Instance()->FGEnabled.value_or_default() &&
+        State::Instance().currentSwapchain != nullptr;
+
+    if (!fgActive &&
+        Config::Instance()->FrameWarpEnabled.value_or_default() &&
+        Config::Instance()->FGHUDFix.value_or_default() &&
+        _device != nullptr)
+    {
+        Hudfix_Dx12::UpscaleStart();
+    }
 
     if (fg == nullptr || State::Instance().activeFgInput != FGInput::Upscaler || _device == nullptr)
         return;
@@ -119,13 +161,43 @@ void UpscalerInputsDx12::UpscaleStart(ID3D12GraphicsCommandList* InCmdList, NVSD
 
     fg->StartNewFrame();
 
-    auto aspectRatio = (float) feature->DisplayWidth() / (float) feature->DisplayHeight();
     fg->SetCameraValues(cameraNear, cameraFar, cameraVFov, aspectRatio, meterFactor);
     fg->SetFrameTimeDelta(State::Instance().lastFGFrameTime);
     fg->SetMVScale(mvScaleX, mvScaleY);
     fg->SetJitter(jitterX, jitterY);
     fg->SetReset(reset);
     fg->SetInterpolationRect(feature->DisplayWidth(), feature->DisplayHeight());
+
+    // Try reading NVNGX matrix parameters — some games provide these via DLSS upscaler
+    {
+        void* clipToPrevClipPtr = nullptr;
+        if (InParameters->Get(NVSDK_NGX_Parameter_DLSS_CLIP_TO_PREV_CLIP_MATRIX, &clipToPrevClipPtr) ==
+                NVSDK_NGX_Result_Success &&
+            clipToPrevClipPtr != nullptr)
+        {
+            fg->SetClipToPrevClipMatrix(static_cast<const float*>(clipToPrevClipPtr));
+            static bool loggedOnce = false;
+            if (!loggedOnce)
+            {
+                LOG_INFO("Got ClipToPrevClipMatrix from NVNGX parameters");
+                loggedOnce = true;
+            }
+        }
+
+        void* invViewProjPtr = nullptr;
+        if (InParameters->Get(NVSDK_NGX_Parameter_DLSS_INV_VIEW_PROJECTION_MATRIX, &invViewProjPtr) ==
+                NVSDK_NGX_Result_Success &&
+            invViewProjPtr != nullptr)
+        {
+            fg->SetInvViewProjMatrix(static_cast<const float*>(invViewProjPtr));
+            static bool loggedOnce = false;
+            if (!loggedOnce)
+            {
+                LOG_INFO("Got InvViewProjectionMatrix from NVNGX parameters");
+                loggedOnce = true;
+            }
+        }
+    }
 
     Hudfix_Dx12::UpscaleStart();
 
@@ -176,6 +248,21 @@ void UpscalerInputsDx12::UpscaleStart(ID3D12GraphicsCommandList* InCmdList, NVSD
             }
 
             fg->SetResource(&setResource);
+
+            if (Config::Instance()->FrameWarpSensitivityAuditLog.value_or_default())
+            {
+                auto mvDesc = paramVelocity->GetDesc();
+                FrameWarpRuntime::TrackMotionVectorSource(
+                    paramVelocity,
+                    setResource.state,
+                    static_cast<UINT>(setResource.width),
+                    setResource.height,
+                    mvDesc.Format,
+                    mvScaleX,
+                    mvScaleY,
+                    false,
+                    "upscale-dlssg-mv");
+            }
         }
 
         ID3D12Resource* paramDepth = nullptr;
@@ -210,6 +297,20 @@ void UpscalerInputsDx12::UpscaleStart(ID3D12GraphicsCommandList* InCmdList, NVSD
 
                         fg->SetResource(&setResource);
 
+                        if (ShouldCaptureVibeFlexDepth())
+                        {
+                            auto depthDesc = setResource.resource->GetDesc();
+                            FrameWarpRuntime::CaptureDepthSource(
+                                commandList,
+                                setResource.resource,
+                                setResource.state,
+                                static_cast<UINT>(setResource.width),
+                                setResource.height,
+                                depthDesc.Format,
+                                fg->IsInvertedDepth(),
+                                "upscale-dlssg-depth-scale");
+                        }
+
                         done = true;
                     }
                 }
@@ -228,6 +329,20 @@ void UpscalerInputsDx12::UpscaleStart(ID3D12GraphicsCommandList* InCmdList, NVSD
                 setResource.validity = FG_ResourceValidity::ValidNow;
 
                 fg->SetResource(&setResource);
+
+                if (ShouldCaptureVibeFlexDepth())
+                {
+                    auto depthDesc = setResource.resource->GetDesc();
+                    FrameWarpRuntime::CaptureDepthSource(
+                        commandList,
+                        setResource.resource,
+                        setResource.state,
+                        static_cast<UINT>(setResource.width),
+                        setResource.height,
+                        depthDesc.Format,
+                        fg->IsInvertedDepth(),
+                        "upscale-dlssg-depth");
+                }
             }
         }
 
@@ -241,6 +356,19 @@ void UpscalerInputsDx12::UpscaleEnd(ID3D12GraphicsCommandList* InCmdList, NVSDK_
     Hudfix_Dx12::SetSkipStatus(false);
 
     auto fg = State::Instance().currentFG;
+    const bool fgUpscalerReady = fg != nullptr && State::Instance().activeFgInput == FGInput::Upscaler &&
+        _device != nullptr;
+    const bool fgActive = fgUpscalerReady && fg->IsActive() &&
+        Config::Instance()->FGEnabled.value_or_default() &&
+        State::Instance().currentSwapchain != nullptr;
+
+    if (!fgActive &&
+        Config::Instance()->FrameWarpEnabled.value_or_default() &&
+        Config::Instance()->FGHUDFix.value_or_default() &&
+        _device != nullptr)
+    {
+        Hudfix_Dx12::UpscaleEnd(feature->FrameCount(), State::Instance().lastFGFrameTime);
+    }
 
     if (fg == nullptr || State::Instance().activeFgInput != FGInput::Upscaler || _device == nullptr)
         return;
@@ -251,12 +379,15 @@ void UpscalerInputsDx12::UpscaleEnd(ID3D12GraphicsCommandList* InCmdList, NVSDK_
     {
         if (Config::Instance()->FGHUDFix.value_or_default())
         {
-            // For signal after mv & depth copies
+            // Generic hudfix pipeline for non-DLSSG backends
             Hudfix_Dx12::UpscaleEnd(feature->FrameCount(), State::Instance().lastFGFrameTime);
 
             ID3D12Resource* output = nullptr;
             if (InParameters->Get(NVSDK_NGX_Parameter_Output, &output) != NVSDK_NGX_Result_Success)
                 InParameters->Get(NVSDK_NGX_Parameter_Output, (void**) &output);
+
+            if (output == nullptr)
+                return;
 
             ResourceInfo info {};
             auto desc = output->GetDesc();

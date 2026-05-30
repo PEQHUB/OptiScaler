@@ -39,6 +39,7 @@
 #include <hooks/Crypt32_Hooks.h>
 #include <hooks/Advapi32_Hooks.h>
 #include <hooks/Streamline_Hooks.h>
+#include <framegen/dlssg/DLSSG_Native.h>
 
 #include <nvapi/NvApiHooks.h>
 
@@ -915,7 +916,16 @@ static void CheckWorkingMode()
             if (slModule != nullptr)
             {
                 LOG_DEBUG("sl.interposer.dll already in memory");
-                StreamlineHooks::hookInterposer(slModule);
+                DLSSGNative::MarkNativeStreamlineModule(slModule, "sl.interposer");
+                if (State::Instance().activeFgOutput != FGOutput::DLSSG ||
+                    DLSSGNative::ShouldHookNativeInterposer())
+                {
+                    StreamlineHooks::hookInterposer(slModule);
+                }
+                else
+                {
+                    LOG_DEBUG("Skipping StreamlineHooks::hookInterposer - DLSSG output active");
+                }
                 slInterposerModule = slModule;
             }
 
@@ -924,7 +934,10 @@ static void CheckWorkingMode()
             if (slDlss != nullptr)
             {
                 LOG_DEBUG("sl.dlss.dll already in memory");
-                StreamlineHooks::hookDlss(slDlss);
+                if (State::Instance().activeFgOutput != FGOutput::DLSSG)
+                    StreamlineHooks::hookDlss(slDlss);
+                else
+                    LOG_DEBUG("Skipping StreamlineHooks::hookDlss - DLSSG output active");
             }
 
             HMODULE slDlssg = nullptr;
@@ -932,7 +945,11 @@ static void CheckWorkingMode()
             if (slDlssg != nullptr)
             {
                 LOG_DEBUG("sl.dlss_g.dll already in memory");
-                StreamlineHooks::hookDlssg(slDlssg);
+                DLSSGNative::MarkNativeStreamlineModule(slDlssg, "sl.dlss_g");
+                if (!DLSSGNative::ShouldSkipStreamlinePluginHooks())
+                    StreamlineHooks::hookDlssg(slDlssg);
+                else
+                    LOG_DEBUG("Skipping StreamlineHooks::hookDlssg - native DLSSG mode active");
             }
 
             HMODULE slReflex = nullptr;
@@ -940,7 +957,10 @@ static void CheckWorkingMode()
             if (slReflex != nullptr)
             {
                 LOG_DEBUG("sl.reflex.dll already in memory");
-                StreamlineHooks::hookReflex(slReflex);
+                if (State::Instance().activeFgOutput != FGOutput::DLSSG)
+                    StreamlineHooks::hookReflex(slReflex);
+                else
+                    LOG_DEBUG("Skipping StreamlineHooks::hookReflex - DLSSG output active");
             }
 
             HMODULE slPcl = nullptr;
@@ -948,7 +968,10 @@ static void CheckWorkingMode()
             if (slPcl != nullptr)
             {
                 LOG_DEBUG("sl.pcl.dll already in memory");
-                StreamlineHooks::hookPcl(slPcl);
+                if (State::Instance().activeFgOutput != FGOutput::DLSSG)
+                    StreamlineHooks::hookPcl(slPcl);
+                else
+                    LOG_DEBUG("Skipping StreamlineHooks::hookPcl - DLSSG output active");
             }
 
             HMODULE slCommon = nullptr;
@@ -956,7 +979,11 @@ static void CheckWorkingMode()
             if (slCommon != nullptr)
             {
                 LOG_DEBUG("sl.common.dll already in memory");
-                StreamlineHooks::hookCommon(slCommon);
+                DLSSGNative::MarkNativeStreamlineModule(slCommon, "sl.common");
+                if (!DLSSGNative::ShouldSkipStreamlinePluginHooks())
+                    StreamlineHooks::hookCommon(slCommon);
+                else
+                    LOG_DEBUG("Skipping StreamlineHooks::hookCommon - native DLSSG mode active");
             }
 
             // XeSS
@@ -1835,6 +1862,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         // Initial state of FG
         State::Instance().activeFgInput = Config::Instance()->FGInput.value_or_default();
         State::Instance().activeFgOutput = Config::Instance()->FGOutput.value_or_default();
+        DLSSGNative::RefreshRuntimeMode();
 
         // Init Kernel proxies
         NtdllProxy::Init();

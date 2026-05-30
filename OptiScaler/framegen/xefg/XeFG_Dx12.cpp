@@ -634,7 +634,10 @@ void XeFG_Dx12::Deactivate()
             auto closeResult = _uiCommandList[fIndex]->Close();
 
             if (closeResult == S_OK)
+            {
                 _gameCommandQueue->ExecuteCommandLists(1, (ID3D12CommandList**) &_uiCommandList[fIndex]);
+                SignalUIFence(fIndex);
+            }
             else
                 LOG_ERROR("_uiCommandList[{}]->Close() error: {:X}", fIndex, (UINT) closeResult);
 
@@ -1098,6 +1101,7 @@ void XeFG_Dx12::ReleaseObjects()
     _mvFlip.reset();
     _depthFlip.reset();
     _depthInvert.reset();
+    ReleaseUIFences();
 }
 
 void XeFG_Dx12::CreateObjects(ID3D12Device* InDevice)
@@ -1178,6 +1182,11 @@ void XeFG_Dx12::CreateObjects(ID3D12Device* InDevice)
             }
         }
 
+        // Create fences for UI command allocator synchronization
+        if (!CreateUIFences())
+        {
+            LOG_ERROR("CreateUIFences failed");
+        }
     } while (false);
 }
 
@@ -1262,7 +1271,10 @@ bool XeFG_Dx12::Present()
             auto closeResult = _uiCommandList[fIndex]->Close();
 
             if (closeResult == S_OK)
+            {
                 _gameCommandQueue->ExecuteCommandLists(1, (ID3D12CommandList**) &_uiCommandList[fIndex]);
+                SignalUIFence(fIndex);
+            }
             else
                 LOG_ERROR("_uiCommandList[{}]->Close() error: {:X}", fIndex, (UINT) closeResult);
 

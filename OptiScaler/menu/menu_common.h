@@ -137,6 +137,9 @@ class MenuCommon
     typedef decltype(&mouse_event) PFN_mouse_event;
     typedef decltype(&GetCursorPos) PFN_GetCursorPos;
     typedef decltype(&SendMessageW) PFN_SendMessageW;
+    typedef decltype(&RegisterRawInputDevices) PFN_RegisterRawInputDevices;
+    typedef decltype(&GetRawInputData) PFN_GetRawInputData;
+    typedef decltype(&GetRawInputBuffer) PFN_GetRawInputBuffer;
 
     inline static PFN_SetCursorPos pfn_SetPhysicalCursorPos = nullptr;
     inline static PFN_SetCursorPos pfn_SetCursorPos = nullptr;
@@ -144,6 +147,9 @@ class MenuCommon
     inline static PFN_mouse_event pfn_mouse_event = nullptr;
     inline static PFN_SendInput pfn_SendInput = nullptr;
     inline static PFN_SendMessageW pfn_SendMessageW = nullptr;
+    inline static PFN_RegisterRawInputDevices pfn_RegisterRawInputDevices = nullptr;
+    inline static PFN_GetRawInputData pfn_GetRawInputData = nullptr;
+    inline static PFN_GetRawInputBuffer pfn_GetRawInputBuffer = nullptr;
     inline static PFN_GetCursorPos pfn_GetCursorPos = nullptr;
 
     inline static bool pfn_SetPhysicalCursorPos_hooked = false;
@@ -152,11 +158,22 @@ class MenuCommon
     inline static bool pfn_mouse_event_hooked = false;
     inline static bool pfn_SendInput_hooked = false;
     inline static bool pfn_SendMessageW_hooked = false;
+    inline static bool pfn_RegisterRawInputDevices_hooked = false;
+    inline static bool pfn_GetRawInputData_hooked = false;
+    inline static bool pfn_GetRawInputBuffer_hooked = false;
 
     inline static RECT _cursorLimit = {};
     inline static POINT _lastPoint = {};
 
     static LRESULT hkSendMessageW(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam);
+    static BOOL hkRegisterRawInputDevices(PCRAWINPUTDEVICE pRawInputDevices, UINT uiNumDevices, UINT cbSize);
+    static UINT hkGetRawInputData(HRAWINPUT hRawInput, UINT uiCommand, LPVOID pData, PUINT pcbSize,
+                                  UINT cbSizeHeader);
+    static UINT hkGetRawInputBuffer(PRAWINPUT pData, PUINT pcbSize, UINT cbSizeHeader);
+    static LRESULT WINAPI FrameWarpRawInputWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+    static void ReadFrameWarpRawInput(HRAWINPUT hRawInput, const char* source, HWND hWnd);
+    static void TrackFrameWarpRawInputWindow(HWND hWnd);
+    static void RestoreFrameWarpRawInputWindows();
 
     static BOOL hkSetPhysicalCursorPos(int x, int y);
     static BOOL hkSetCursorPos(int x, int y);

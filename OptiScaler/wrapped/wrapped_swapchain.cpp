@@ -6,7 +6,11 @@
 
 #include <nvapi/fakenvapi.h>
 #include <hooks/Reflex_Hooks.h>
+#include <latency/NativeLowLatency.h>
 #include <hooks/D3D12_Hooks.h>
+#include <hooks/FG_Hooks.h>
+#include <framewarp/FrameWarp.h>
+#include <framegen/dlssg/DLSSG_Native.h>
 
 #include <menu/menu_overlay_dx.h>
 
@@ -53,46 +57,62 @@ static void WaitForGPUIdle(IUnknown* object)
         return;
 
     ID3D12CommandQueue* queue = nullptr;
+    if (object->QueryInterface(IID_PPV_ARGS(&queue)) != S_OK || queue == nullptr)
+        return;
 
-    if (object->QueryInterface(IID_PPV_ARGS(&queue)) == S_OK)
+    LOG_DEBUG("Command queue obtained for GPU idle wait");
+
+    if (resizeFence == nullptr)
     {
-        LOG_DEBUG("Command queue obtained for GPU idle wait");
+        HRESULT hr = State::Instance().currentD3D12Device->CreateFence(
+            resizeFenceValue, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&resizeFence));
+        if (FAILED(hr) || resizeFence == nullptr)
+        {
+            LOG_WARN("WaitForGPUIdle: CreateFence failed {:X}", hr);
+            queue->Release();
+            return;
+        }
+    }
+
+    if (resizeFenceEvent == nullptr)
+    {
+        resizeFenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+        if (resizeFenceEvent == nullptr)
+        {
+            LOG_WARN("WaitForGPUIdle: CreateEvent failed");
+            queue->Release();
+            return;
+        }
+    }
+
+    LOG_DEBUG("Waiting for GPU to finish before resizing buffers");
+
+    resizeFenceValue++;
+    HRESULT signalHr = queue->Signal(resizeFence, resizeFenceValue);
+    if (FAILED(signalHr))
+    {
+        LOG_WARN("WaitForGPUIdle: Signal failed {:X}", signalHr);
         queue->Release();
+        return;
     }
 
-    if (queue != nullptr && resizeFence != nullptr && resizeFenceEvent != nullptr)
+    if (resizeFence->GetCompletedValue() < resizeFenceValue)
     {
-        if (State::Instance().currentD3D12Device != nullptr)
+        HRESULT eventHr = resizeFence->SetEventOnCompletion(resizeFenceValue, resizeFenceEvent);
+        if (FAILED(eventHr))
         {
-            if (resizeFence != nullptr)
-            {
-                resizeFence->Release();
-                resizeFence = nullptr;
-            }
-
-            if (resizeFenceEvent != nullptr)
-            {
-                CloseHandle(resizeFenceEvent);
-                resizeFenceEvent = nullptr;
-            }
-
-            State::Instance().currentD3D12Device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&resizeFence));
-            resizeFenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+            LOG_WARN("WaitForGPUIdle: SetEventOnCompletion failed {:X}", eventHr);
+            queue->Release();
+            return;
         }
 
-        LOG_DEBUG("Waiting for GPU to finish before resizing buffers");
-
-        resizeFenceValue++;
-        queue->Signal(resizeFence, resizeFenceValue);
-
-        if (resizeFence->GetCompletedValue() < resizeFenceValue)
-        {
-            resizeFence->SetEventOnCompletion(resizeFenceValue, resizeFenceEvent);
-            // Max 5 sec
-            auto waitResult = WaitForSingleObject(resizeFenceEvent, 5000);
-            LOG_DEBUG("WaitForSingleObject result: {:X}", waitResult);
-        }
+        // Max 5 sec
+        auto waitResult = WaitForSingleObject(resizeFenceEvent, 5000);
+        if (waitResult != WAIT_OBJECT_0)
+            LOG_WARN("WaitForGPUIdle timeout or failed: {}", waitResult);
     }
+
+    queue->Release();
 }
 
 #ifdef DXGI_DEBUG_ENABLED
@@ -158,6 +178,7 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     HRESULT presentResult;
 
     auto willPresent = (Flags & DXGI_PRESENT_TEST) == 0;
+    bool frameWarpInputFrameApplied = false;
 
     if (willPresent)
     {
@@ -277,6 +298,45 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     }
 
     auto fg = State::Instance().currentFG;
+    const bool optiScalerDlssgLatePresentOwnedByFgHook =
+        willPresent &&
+        State::Instance().activeFgOutput == FGOutput::DLSSG &&
+        Config::Instance()->FrameWarpDLSSGMode.value_or_default() == 3 &&
+        !DLSSGNative::IsAttachActive();
+    auto frameWarpOwner = optiScalerDlssgLatePresentOwnedByFgHook
+        ? FrameWarpPresentationOwner::Disabled
+        : FrameWarpRuntime::ResolvePresentationOwner("LocalPresent", willPresent);
+    const bool frameWarpStandaloneOwner = frameWarpOwner == FrameWarpPresentationOwner::StandaloneNoFG;
+    const bool frameWarpXeFGFinalOwner = frameWarpOwner == FrameWarpPresentationOwner::XeFGInputFrame;
+    const bool frameWarpNativeDLSSGOwner = frameWarpOwner == FrameWarpPresentationOwner::NativeDLSSGLatePresent;
+    const bool frameWarpXeFGInternalPresent = frameWarpXeFGFinalOwner && FGHooks::IsXeFGInternalPresentActive();
+    if (willPresent && (frameWarpXeFGFinalOwner || frameWarpNativeDLSSGOwner))
+    {
+        auto& fwStatus = State::Instance().frameWarpStatus;
+        if (frameWarpXeFGFinalOwner)
+        {
+            fwStatus.xefgFinalPresentCount++;
+            fwStatus.xefgFinalPresentLastInternal = frameWarpXeFGInternalPresent;
+            if (frameWarpXeFGInternalPresent)
+                fwStatus.xefgFinalPresentInternalCount++;
+            else
+                fwStatus.xefgFinalPresentAsyncCount++;
+
+            static uint64_t xefgLocalPresentLogCount = 0;
+            xefgLocalPresentLogCount++;
+            if (xefgLocalPresentLogCount <= 10 || xefgLocalPresentLogCount % 300 == 0)
+                LOG_DEBUG("FrameWarp: XeFG final LocalPresent #{} internal={} async={}",
+                    fwStatus.xefgFinalPresentCount,
+                    frameWarpXeFGInternalPresent,
+                    !frameWarpXeFGInternalPresent);
+        }
+        else
+        {
+            fwStatus.dlssgLatePresentAttemptCount++;
+            fwStatus.dlssgLatePresentLastApplied = false;
+            strncpy_s(fwStatus.dlssgLatePresentLastReason, "native DLSSG pending warp", _TRUNCATE);
+        }
+    }
     if (willPresent && fg != nullptr)
         ReflexHooks::update(fg->IsActive(), false);
     else
@@ -369,11 +429,123 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
         if (auto currentFeature = State::Instance().currentFeature; currentFeature != nullptr)
             currentFeature->TickFrozenCheck();
 
-        // Draw overlay
-        MenuOverlayDx::Present(pSwapChain, SyncInterval, Flags, pPresentParameters, pDevice, hWnd, isUWP);
+        // FrameWarp input-frame/final-present path: run before the overlay so UI is not warped.
+        // FSRFG owns its generated-frame path through the present callback.
+        // XeFG's public API does not expose generated-frame callbacks; warp every
+        // real LocalPresent it emits so both synchronous and async outputs are covered.
+        if (!State::Instance().dx11FGMode && Config::Instance()->FrameWarpEnabled.value_or_default() &&
+            (frameWarpStandaloneOwner || frameWarpXeFGFinalOwner || frameWarpNativeDLSSGOwner))
+        {
+            ID3D12CommandQueue* frameWarpQueue = nullptr;
+            if (pDevice != nullptr && pDevice->QueryInterface(IID_PPV_ARGS(&frameWarpQueue)) == S_OK)
+            {
+                ID3D12Device* frameWarpDevice = nullptr;
+                if (frameWarpQueue->GetDevice(IID_PPV_ARGS(&frameWarpDevice)) == S_OK && frameWarpDevice != nullptr)
+                {
+                    IDXGISwapChain3* swapChain3 = nullptr;
+                    if (pSwapChain->QueryInterface(IID_PPV_ARGS(&swapChain3)) == S_OK && swapChain3 != nullptr)
+                    {
+                        ID3D12Resource* backBuffer = nullptr;
+                        UINT backBufferIndex = swapChain3->GetCurrentBackBufferIndex();
+                        if (swapChain3->GetBuffer(backBufferIndex, IID_PPV_ARGS(&backBuffer)) == S_OK &&
+                            backBuffer != nullptr)
+                        {
+                            auto bbDesc = backBuffer->GetDesc();
+                            UINT width = static_cast<UINT>(bbDesc.Width);
+                            UINT height = bbDesc.Height;
+                            DXGI_FORMAT format = bbDesc.Format;
+
+                            if (FrameWarpRuntime::EnsureInitialized(frameWarpDevice, width, height, format))
+                            {
+                                auto& fwStatus = State::Instance().frameWarpStatus;
+                                if (frameWarpXeFGFinalOwner)
+                                    fwStatus.xefgFinalWarpAttemptCount++;
+
+                                frameWarpInputFrameApplied =
+                                    FrameWarpRuntime::ApplyStandalone(pSwapChain, frameWarpQueue);
+
+                                if (frameWarpXeFGFinalOwner)
+                                {
+                                    if (fwStatus.lastWarpApplied)
+                                        fwStatus.xefgFinalWarpAppliedCount++;
+                                    else
+                                        fwStatus.xefgFinalWarpSkippedCount++;
+                                }
+                                else if (frameWarpNativeDLSSGOwner)
+                                {
+                                    fwStatus.dlssgLatePresentLastApplied = fwStatus.lastWarpApplied;
+                                    if (fwStatus.lastWarpApplied)
+                                    {
+                                        fwStatus.dlssgLatePresentAppliedCount++;
+                                        strncpy_s(fwStatus.dlssgLatePresentLastReason,
+                                                  "native DLSSG late-present warped", _TRUNCATE);
+                                    }
+                                    else
+                                    {
+                                        fwStatus.dlssgLatePresentSkippedCount++;
+                                        strncpy_s(fwStatus.dlssgLatePresentLastReason,
+                                                  fwStatus.lastSkipReason[0] ? fwStatus.lastSkipReason
+                                                                            : "native warp not applied",
+                                                  _TRUNCATE);
+                                    }
+                                }
+                            }
+                            else if (frameWarpNativeDLSSGOwner)
+                            {
+                                auto& fwStatus = State::Instance().frameWarpStatus;
+                                fwStatus.dlssgLatePresentSkippedCount++;
+                                strncpy_s(fwStatus.dlssgLatePresentLastReason, "FrameWarp init failed", _TRUNCATE);
+                            }
+
+                            backBuffer->Release();
+                        }
+                        else
+                        {
+                            LOG_DEBUG("FrameWarp input-frame skipped: current backbuffer unavailable");
+                            if (frameWarpNativeDLSSGOwner)
+                            {
+                                auto& fwStatus = State::Instance().frameWarpStatus;
+                                fwStatus.dlssgLatePresentSkippedCount++;
+                                strncpy_s(fwStatus.dlssgLatePresentLastReason, "backbuffer unavailable", _TRUNCATE);
+                            }
+                        }
+
+                        swapChain3->Release();
+                    }
+                    else
+                    {
+                        LOG_DEBUG("FrameWarp input-frame skipped: swapchain3 unavailable during init");
+                        if (frameWarpNativeDLSSGOwner)
+                        {
+                            auto& fwStatus = State::Instance().frameWarpStatus;
+                            fwStatus.dlssgLatePresentSkippedCount++;
+                            strncpy_s(fwStatus.dlssgLatePresentLastReason, "swapchain3 unavailable", _TRUNCATE);
+                        }
+                    }
+
+                    frameWarpDevice->Release();
+                }
+
+                frameWarpQueue->Release();
+            }
+            else if (frameWarpNativeDLSSGOwner)
+            {
+                auto& fwStatus = State::Instance().frameWarpStatus;
+                fwStatus.dlssgLatePresentSkippedCount++;
+                strncpy_s(fwStatus.dlssgLatePresentLastReason, "command queue unavailable", _TRUNCATE);
+            }
+        }
+
+        // Draw overlay — skip in DX11 FG mode: LocalPresent runs on Streamline's background
+        // thread, but RenderImGui_DX11 uses the DX11 device context (single-threaded) and
+        // ImGui (not thread-safe). The menu is already rendered on the game thread in
+        // WrappedIDXGISwapChain4::Present before Dx11FGProxyPresent copies to the FG backbuffer.
+        if (!State::Instance().dx11FGMode)
+            MenuOverlayDx::Present(pSwapChain, SyncInterval, Flags, pPresentParameters, pDevice, hWnd, isUWP);
 
         LOG_DEBUG("Calling fakenvapi");
-        if (State::Instance().activeFgOutput == FGOutput::FSRFG || State::Instance().activeFgOutput == FGOutput::XeFG)
+        if (State::Instance().activeFgOutput == FGOutput::FSRFG || State::Instance().activeFgOutput == FGOutput::XeFG ||
+            State::Instance().activeFgOutput == FGOutput::DLSSG)
         {
             static UINT64 fgPresentFrame = 0;
             auto fgIsActive = fg != nullptr && fg->IsActive() && !fg->IsPaused();
@@ -386,7 +558,10 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
 
             auto isInterpolated = fgIsActive && (_frameCounter - fgPresentFrame) > 0;
 
-            fakenvapi::reportFGPresent(pSwapChain, fgIsActive, isInterpolated);
+            if (NativeLowLatency::IsAvailable())
+                NativeLowLatency::ReportFGPresent(pSwapChain, fgIsActive, isInterpolated);
+            else
+                fakenvapi::reportFGPresent(pSwapChain, fgIsActive, isInterpolated);
         }
 
         _frameCounter++;
@@ -398,13 +573,55 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     // swapchain present
     if (pPresentParameters == nullptr)
         presentResult = pSwapChain->Present(SyncInterval, Flags);
+    else if (frameWarpInputFrameApplied)
+    {
+        DXGI_PRESENT_PARAMETERS frameWarpPresentParams {};
+        presentResult = ((IDXGISwapChain1*) pSwapChain)->Present1(SyncInterval, Flags, &frameWarpPresentParams);
+    }
     else
         presentResult = ((IDXGISwapChain1*) pSwapChain)->Present1(SyncInterval, Flags, pPresentParameters);
 
     LOG_DEBUG("Original present result: {:X}", (UINT) presentResult);
 
+    if (willPresent && State::Instance().activeFgOutput == FGOutput::DLSSG &&
+        Config::Instance()->FrameWarpComparisonLog.value_or_default() &&
+        (State::Instance().dlssgNativeStreamlineDetected || DLSSGNative::IsNativeRuntimeActive()))
+    {
+        static uint64_t nativeCompareCount = 0;
+        nativeCompareCount++;
+        if (nativeCompareCount <= 10 || nativeCompareCount % 60 == 0)
+        {
+            auto& state = State::Instance();
+            auto& status = state.frameWarpStatus;
+            LOG_INFO("VF2NativeDLSSG #{} present={:X} nativeDetected={} attach={} passthrough={} evalCount={} lastEvalFrame={} owner={} reason={} warpApplied={} rawAgeMs={:.3f} mouse=({:.1f},{:.1f}) depthUsed={} depthReason={} latePresent={}/{} skip={} lateReason={} module={} path={}",
+                     nativeCompareCount,
+                     static_cast<uint32_t>(presentResult),
+                     state.dlssgNativeStreamlineDetected,
+                     state.dlssgNativeAttachActive,
+                     state.dlssgNativePassthroughActive,
+                     state.dlssgNativeEvaluateCount,
+                     state.dlssgNativeLastEvaluateFrame,
+                     status.lastPresentationOwnerName,
+                     status.lastPresentationOwnerReason,
+                     status.lastWarpApplied,
+                     status.lastInputSampleAgeMs,
+                     status.lastFinalMouseDeltaDx,
+                     status.lastFinalMouseDeltaDy,
+                     status.lastDepthUsed,
+                     status.lastDepthReason,
+                     status.dlssgLatePresentAppliedCount,
+                     status.dlssgLatePresentAttemptCount,
+                     status.dlssgLatePresentSkippedCount,
+                     status.dlssgLatePresentLastReason,
+                     state.dlssgNativeLastModule[0] ? state.dlssgNativeLastModule : "none",
+                     state.dlssgNativeLastPath[0] ? state.dlssgNativeLastPath : "unknown");
+        }
+    }
+
     if (presentResult == S_OK)
+    {
         LOG_TRACE("4 {}, Present result: {:X}", _frameCounter, (UINT) presentResult);
+    }
     else
         LOG_ERROR("4 {:X}", (UINT) presentResult);
 
@@ -585,6 +802,22 @@ ULONG STDMETHODCALLTYPE WrappedIDXGISwapChain4::Release()
                 State::Instance().currentFGSwapchain = nullptr;
         }
 
+        // Clean up DX11 FG proxy resources and reset state for re-initialization.
+        // Some games (e.g., Crysis 2 Remastered) create a throwaway swapchain during
+        // init, destroy it, then create the real one. Without cleanup, proxy resources
+        // leak and dx11FGMode stays true, preventing the second swapchain from getting
+        // a proper FG proxy.
+        if (_dx11FGProxy)
+        {
+            CleanupDx11FGProxy();
+            State::Instance().dx11FGMode = false;
+            State::Instance().fgSwapchainWidth = 0;
+            State::Instance().fgSwapchainHeight = 0;
+            if (State::Instance().currentWrappedSwapchain == (IDXGISwapChain*)this)
+                State::Instance().currentWrappedSwapchain = nullptr;
+            LOG_INFO("DX11 FG: Proxy destroyed, state reset for re-initialization");
+        }
+
         auto refCount = _real->Release();
 
         // Disabled for now, cause issues with some games
@@ -639,6 +872,12 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::GetParent(REFIID riid, void** 
 //
 HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::GetDevice(REFIID riid, void** ppDevice)
 {
+    // DX11 FG proxy: _real is DX12 FG swapchain — QI for ID3D11Device would fail
+    // Return the real DX11 device stored during proxy init
+    if (_dx11FGProxy && _proxyDx11Device != nullptr)
+    {
+        return _proxyDx11Device->QueryInterface(riid, ppDevice);
+    }
     return _real->GetDevice(riid, ppDevice);
 }
 
@@ -648,6 +887,22 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::Present(UINT SyncInterval, UIN
     if (_real == nullptr)
         return DXGI_ERROR_DEVICE_REMOVED;
 
+    // Deferred FG swapchain resize — NO mutex held, safe from SL re-entry deadlock
+    if (_dx11FGProxy && _pendingFGResize.load())
+    {
+        _pendingFGResize.store(false);
+        LOG_INFO("DX11 FG Proxy: Applying deferred FG resize {}x{}", _pendingResizeWidth, _pendingResizeHeight);
+        spdlog::default_logger()->flush();
+        HRESULT hr = _fgSwapChain->ResizeBuffers(
+            _pendingResizeBufferCount, _pendingResizeWidth, _pendingResizeHeight,
+            _pendingResizeFormat, _pendingResizeFlags);
+        if (FAILED(hr))
+            LOG_ERROR("DX11 FG Proxy: Deferred FG resize failed {:X}", (UINT)hr);
+        else
+            LOG_INFO("DX11 FG Proxy: FG swapchain resized to {}x{}", _pendingResizeWidth, _pendingResizeHeight);
+        spdlog::default_logger()->flush();
+    }
+
 #ifdef USE_LOCAL_MUTEX
     OwnedLockGuard lock(_localMutex, 4);
 #endif
@@ -656,12 +911,25 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::Present(UINT SyncInterval, UIN
 
     if ((Flags & DXGI_PRESENT_TEST) == 0)
     {
-        result = LocalPresent(_real, SyncInterval, Flags, nullptr, _device, _handle, _uwp);
+        // DX11 FG proxy: fence sync + copy to FG backbuffer + trigger FG present
+        if (_dx11FGProxy && _fgSwapChain != nullptr)
+        {
+            // Render menu overlay HERE (outside Dx11FGProxyPresent) so ImGui's
+            // stack frames are fully unwound before the deep FG present chain.
+            // The combined depth of ImGui + Streamline + DLSSG + NVIDIA driver
+            // exceeds the 1MB thread stack limit, causing stack overflow.
+            MenuOverlayDx::Present(this, SyncInterval, Flags, nullptr, _device, _handle, _uwp);
+            result = Dx11FGProxyPresent(SyncInterval, Flags);
+        }
+        else
+        {
+            result = LocalPresent(_real, SyncInterval, Flags, nullptr, _device, _handle, _uwp);
 
-        // When Reflex can't be used to limit, sleep in present
-        if (!State::Instance().reflexLimitsFps && State::Instance().activeFgOutput == FGOutput::NoFG &&
-            !State::Instance().isRunningOnDXVK)
-            FrameLimit::sleep(false);
+            // When Reflex can't be used to limit, sleep in present
+            if (!State::Instance().reflexLimitsFps && State::Instance().activeFgOutput == FGOutput::NoFG &&
+                !State::Instance().isRunningOnDXVK)
+                FrameLimit::sleep(false);
+        }
     }
     else
     {
@@ -673,6 +941,11 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::Present(UINT SyncInterval, UIN
 
 HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::GetBuffer(UINT Buffer, REFIID riid, void** ppSurface)
 {
+    // DX11 FG proxy: return shared DX11 texture instead of real backbuffer
+    if (_dx11FGProxy && Buffer < _proxyBufferCount && _proxyBuffers[Buffer] != nullptr)
+    {
+        return _proxyBuffers[Buffer]->QueryInterface(riid, ppSurface);
+    }
     auto result = _real->GetBuffer(Buffer, riid, ppSurface);
     return result;
 }
@@ -734,7 +1007,16 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::GetFullscreenState(BOOL* pFull
     return _real->GetFullscreenState(pFullscreen, ppTarget);
 }
 
-HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::GetDesc(DXGI_SWAP_CHAIN_DESC* pDesc) { return _real->GetDesc(pDesc); }
+HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::GetDesc(DXGI_SWAP_CHAIN_DESC* pDesc)
+{
+    // DX11 FG proxy: return the original DX11-compatible desc, not the FG swapchain's
+    if (_dx11FGProxy && pDesc)
+    {
+        *pDesc = _proxyDesc;
+        return S_OK;
+    }
+    return _real->GetDesc(pDesc);
+}
 
 HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::ResizeBuffers(UINT BufferCount, UINT Width, UINT Height,
                                                                 DXGI_FORMAT NewFormat, UINT SwapChainFlags)
@@ -785,6 +1067,107 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::ResizeBuffers(UINT BufferCount
 
     LOG_DEBUG("BufferCount: {0}, Width: {1}, Height: {2}, NewFormat: {3}, SwapChainFlags: {4:X}", BufferCount, Width,
               Height, (UINT) NewFormat, SwapChainFlags);
+
+    // DX11 FG proxy mode: recreate proxy shared textures, do NOT forward to FG swapchain
+    // (forwarding causes Streamline to re-enter ResizeBuffers → deadlock on non-recursive mutex)
+    if (_dx11FGProxy)
+    {
+        LOG_INFO("DX11 FG Proxy: ResizeBuffers {}x{}, fmt {}", Width, Height, (UINT)NewFormat);
+
+        // Release old proxy DX12 resources and shared handles (keep fence + cmd list)
+        for (UINT i = 0; i < 4; i++)
+        {
+            if (_proxyDx12Resources[i]) { _proxyDx12Resources[i]->Release(); _proxyDx12Resources[i] = nullptr; }
+            if (_proxySharedHandles[i]) { CloseHandle(_proxySharedHandles[i]); _proxySharedHandles[i] = nullptr; }
+            if (_proxyBuffers[i]) { _proxyBuffers[i]->Release(); _proxyBuffers[i] = nullptr; }
+        }
+
+        // Update proxy desc with new dimensions
+        if (Width > 0)  _proxyDesc.BufferDesc.Width = Width;
+        if (Height > 0) _proxyDesc.BufferDesc.Height = Height;
+        if (NewFormat != DXGI_FORMAT_UNKNOWN) _proxyDesc.BufferDesc.Format = NewFormat;
+        if (BufferCount > 0) _proxyBufferCount = std::min(BufferCount, 4u);
+
+        // Recreate shared DX11 textures with new dimensions
+        D3D11_TEXTURE2D_DESC texDesc = {};
+        texDesc.Width = _proxyDesc.BufferDesc.Width;
+        texDesc.Height = _proxyDesc.BufferDesc.Height;
+        texDesc.Format = _proxyDesc.BufferDesc.Format;
+        texDesc.MipLevels = 1;
+        texDesc.ArraySize = 1;
+        texDesc.SampleDesc = {1, 0};
+        texDesc.Usage = D3D11_USAGE_DEFAULT;
+        texDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        texDesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+
+        result = S_OK;
+        for (UINT i = 0; i < _proxyBufferCount; i++)
+        {
+            HRESULT hr = _proxyDx11Device->CreateTexture2D(&texDesc, nullptr, &_proxyBuffers[i]);
+            if (FAILED(hr) || !_proxyBuffers[i])
+            {
+                LOG_ERROR("DX11 FG Proxy: ResizeBuffers failed to create texture {} ({:X})", i, (UINT)hr);
+                result = hr;
+                break;
+            }
+
+            IDXGIResource1* dxgiRes = nullptr;
+            hr = _proxyBuffers[i]->QueryInterface(IID_PPV_ARGS(&dxgiRes));
+            if (FAILED(hr) || !dxgiRes) { result = hr; break; }
+
+            hr = dxgiRes->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ, nullptr, &_proxySharedHandles[i]);
+            dxgiRes->Release();
+            if (FAILED(hr)) { result = hr; break; }
+
+            hr = _proxyDx12Device->OpenSharedHandle(_proxySharedHandles[i], IID_PPV_ARGS(&_proxyDx12Resources[i]));
+            if (FAILED(hr)) { result = hr; break; }
+
+            LOG_INFO("DX11 FG Proxy: Resized texture {} ({}x{}, fmt {})",
+                     i, texDesc.Width, texDesc.Height, (UINT)texDesc.Format);
+        }
+
+        _proxyCurrentBuffer = 0;
+
+        if (result == S_OK && State::Instance().currentFeature == nullptr)
+        {
+            State::Instance().screenWidth = static_cast<float>(_proxyDesc.BufferDesc.Width);
+            State::Instance().screenHeight = static_cast<float>(_proxyDesc.BufferDesc.Height);
+            State::Instance().lastMipBias = 100.0f;
+            State::Instance().lastMipBiasMax = -100.0f;
+        }
+
+        // Update SCbuffers with proxy buffers
+        State::Instance().SCbuffers.clear();
+        for (UINT i = 0; i < _proxyBufferCount; i++)
+        {
+            if (_proxyBuffers[i])
+            {
+                State::Instance().SCbuffers.push_back(_proxyBuffers[i]);
+            }
+        }
+
+        LOG_DEBUG("DX11 FG Proxy: ResizeBuffers result: {:X}", (UINT)result);
+
+        // Schedule deferred FG swapchain resize (can't do it here — mutex deadlock)
+        _pendingResizeBufferCount = _proxyBufferCount;
+        _pendingResizeWidth = _proxyDesc.BufferDesc.Width;
+        _pendingResizeHeight = _proxyDesc.BufferDesc.Height;
+        _pendingResizeFormat = _proxyDesc.BufferDesc.Format;
+        _pendingResizeFlags = SwapChainFlags;
+        _pendingFGResize.store(true);
+        State::Instance().fgSwapchainWidth = _proxyDesc.BufferDesc.Width;
+        State::Instance().fgSwapchainHeight = _proxyDesc.BufferDesc.Height;
+        LOG_INFO("DX11 FG Proxy: Scheduled deferred FG resize {}x{}", _pendingResizeWidth, _pendingResizeHeight);
+        spdlog::default_logger()->flush();
+
+        if (State::Instance().currentFG != nullptr && Config::Instance()->FGUseMutexForSwapchain.value_or_default())
+        {
+            LOG_TRACE("Releasing ffxMutex: {}", State::Instance().currentFG->Mutex.getOwner());
+            State::Instance().currentFG->Mutex.unlockThis(3);
+        }
+
+        return result;
+    }
 
     WaitForGPUIdle(_device);
 
@@ -972,6 +1355,22 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::GetLastPresentCount(UINT* pLas
 //
 HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::GetDesc1(DXGI_SWAP_CHAIN_DESC1* pDesc)
 {
+    // DX11 FG proxy: return desc matching proxy dimensions and original swap effect
+    if (_dx11FGProxy && pDesc)
+    {
+        pDesc->Width = _proxyDesc.BufferDesc.Width;
+        pDesc->Height = _proxyDesc.BufferDesc.Height;
+        pDesc->Format = _proxyDesc.BufferDesc.Format;
+        pDesc->Stereo = FALSE;
+        pDesc->SampleDesc = _proxyDesc.SampleDesc;
+        pDesc->BufferUsage = _proxyDesc.BufferUsage;
+        pDesc->BufferCount = _proxyBufferCount;
+        pDesc->Scaling = DXGI_SCALING_STRETCH;
+        pDesc->SwapEffect = _proxyDesc.SwapEffect;
+        pDesc->AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
+        pDesc->Flags = _proxyDesc.Flags;
+        return S_OK;
+    }
     return _real1->GetDesc1(pDesc);
 }
 
@@ -993,6 +1392,22 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::Present1(UINT SyncInterval, UI
     if (_real1 == nullptr)
         return DXGI_ERROR_DEVICE_REMOVED;
 
+    // Deferred FG swapchain resize — NO mutex held, safe from SL re-entry deadlock
+    if (_dx11FGProxy && _pendingFGResize.load())
+    {
+        _pendingFGResize.store(false);
+        LOG_INFO("DX11 FG Proxy: Applying deferred FG resize {}x{}", _pendingResizeWidth, _pendingResizeHeight);
+        spdlog::default_logger()->flush();
+        HRESULT hr = _fgSwapChain->ResizeBuffers(
+            _pendingResizeBufferCount, _pendingResizeWidth, _pendingResizeHeight,
+            _pendingResizeFormat, _pendingResizeFlags);
+        if (FAILED(hr))
+            LOG_ERROR("DX11 FG Proxy: Deferred FG resize failed {:X}", (UINT)hr);
+        else
+            LOG_INFO("DX11 FG Proxy: FG swapchain resized to {}x{}", _pendingResizeWidth, _pendingResizeHeight);
+        spdlog::default_logger()->flush();
+    }
+
 #ifdef USE_LOCAL_MUTEX
     OwnedLockGuard lock(_localMutex, 5);
 #endif
@@ -1001,12 +1416,21 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::Present1(UINT SyncInterval, UI
 
     if ((Flags & DXGI_PRESENT_TEST) == 0)
     {
-        result = LocalPresent(_real1, SyncInterval, Flags, pPresentParameters, _device, _handle, _uwp);
+        // DX11 FG proxy: fence sync + copy to FG backbuffer + trigger FG present
+        if (_dx11FGProxy && _fgSwapChain != nullptr)
+        {
+            MenuOverlayDx::Present(this, SyncInterval, Flags, nullptr, _device, _handle, _uwp);
+            result = Dx11FGProxyPresent(SyncInterval, Flags);
+        }
+        else
+        {
+            result = LocalPresent(_real1, SyncInterval, Flags, pPresentParameters, _device, _handle, _uwp);
 
-        // When Reflex can't be used to limit, sleep in present
-        if (!State::Instance().reflexLimitsFps && State::Instance().activeFgOutput == FGOutput::NoFG &&
-            !State::Instance().isRunningOnDXVK)
-            FrameLimit::sleep(false);
+            // When Reflex can't be used to limit, sleep in present
+            if (!State::Instance().reflexLimitsFps && State::Instance().activeFgOutput == FGOutput::NoFG &&
+                !State::Instance().isRunningOnDXVK)
+                FrameLimit::sleep(false);
+        }
     }
     else
     {
@@ -1084,6 +1508,8 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::GetMatrixTransform(DXGI_MATRIX
 
 UINT STDMETHODCALLTYPE WrappedIDXGISwapChain4::GetCurrentBackBufferIndex(void)
 {
+    if (_dx11FGProxy)
+        return _proxyCurrentBuffer;
     auto index = _real3->GetCurrentBackBufferIndex();
     // LOG_TRACE("index: {}", index);
     return index;
@@ -1156,6 +1582,94 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::ResizeBuffers1(UINT BufferCoun
 
     LOG_DEBUG("BufferCount: {}, Width: {}, Height: {}, NewFormat: {}, SwapChainFlags: {:X}", BufferCount, Width, Height,
               (UINT) Format, SwapChainFlags);
+
+    // DX11 FG proxy mode: recreate proxy shared textures, do NOT forward to FG swapchain
+    if (_dx11FGProxy)
+    {
+        LOG_INFO("DX11 FG Proxy: ResizeBuffers1 {}x{}, fmt {}", Width, Height, (UINT)Format);
+
+        // Release old proxy DX12 resources and shared handles (keep fence + cmd list)
+        for (UINT i = 0; i < 4; i++)
+        {
+            if (_proxyDx12Resources[i]) { _proxyDx12Resources[i]->Release(); _proxyDx12Resources[i] = nullptr; }
+            if (_proxySharedHandles[i]) { CloseHandle(_proxySharedHandles[i]); _proxySharedHandles[i] = nullptr; }
+            if (_proxyBuffers[i]) { _proxyBuffers[i]->Release(); _proxyBuffers[i] = nullptr; }
+        }
+
+        if (Width > 0)  _proxyDesc.BufferDesc.Width = Width;
+        if (Height > 0) _proxyDesc.BufferDesc.Height = Height;
+        if (Format != DXGI_FORMAT_UNKNOWN) _proxyDesc.BufferDesc.Format = Format;
+        if (BufferCount > 0) _proxyBufferCount = std::min(BufferCount, 4u);
+
+        D3D11_TEXTURE2D_DESC texDesc = {};
+        texDesc.Width = _proxyDesc.BufferDesc.Width;
+        texDesc.Height = _proxyDesc.BufferDesc.Height;
+        texDesc.Format = _proxyDesc.BufferDesc.Format;
+        texDesc.MipLevels = 1;
+        texDesc.ArraySize = 1;
+        texDesc.SampleDesc = {1, 0};
+        texDesc.Usage = D3D11_USAGE_DEFAULT;
+        texDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        texDesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+
+        result = S_OK;
+        for (UINT i = 0; i < _proxyBufferCount; i++)
+        {
+            HRESULT hr = _proxyDx11Device->CreateTexture2D(&texDesc, nullptr, &_proxyBuffers[i]);
+            if (FAILED(hr) || !_proxyBuffers[i]) { result = hr; break; }
+
+            IDXGIResource1* dxgiRes = nullptr;
+            hr = _proxyBuffers[i]->QueryInterface(IID_PPV_ARGS(&dxgiRes));
+            if (FAILED(hr) || !dxgiRes) { result = hr; break; }
+
+            hr = dxgiRes->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ, nullptr, &_proxySharedHandles[i]);
+            dxgiRes->Release();
+            if (FAILED(hr)) { result = hr; break; }
+
+            hr = _proxyDx12Device->OpenSharedHandle(_proxySharedHandles[i], IID_PPV_ARGS(&_proxyDx12Resources[i]));
+            if (FAILED(hr)) { result = hr; break; }
+        }
+
+        _proxyCurrentBuffer = 0;
+
+        if (result == S_OK && State::Instance().currentFeature == nullptr)
+        {
+            State::Instance().screenWidth = static_cast<float>(_proxyDesc.BufferDesc.Width);
+            State::Instance().screenHeight = static_cast<float>(_proxyDesc.BufferDesc.Height);
+            State::Instance().lastMipBias = 100.0f;
+            State::Instance().lastMipBiasMax = -100.0f;
+        }
+
+        State::Instance().SCbuffers.clear();
+        for (UINT i = 0; i < _proxyBufferCount; i++)
+        {
+            if (_proxyBuffers[i])
+                State::Instance().SCbuffers.push_back(_proxyBuffers[i]);
+        }
+
+        LOG_DEBUG("DX11 FG Proxy: ResizeBuffers1 result: {:X}", (UINT)result);
+
+        // Schedule deferred FG swapchain resize (can't do it here — mutex deadlock)
+        _pendingResizeBufferCount = _proxyBufferCount;
+        _pendingResizeWidth = _proxyDesc.BufferDesc.Width;
+        _pendingResizeHeight = _proxyDesc.BufferDesc.Height;
+        _pendingResizeFormat = _proxyDesc.BufferDesc.Format;
+        _pendingResizeFlags = SwapChainFlags;
+        _pendingFGResize.store(true);
+        State::Instance().fgSwapchainWidth = _proxyDesc.BufferDesc.Width;
+        State::Instance().fgSwapchainHeight = _proxyDesc.BufferDesc.Height;
+        LOG_INFO("DX11 FG Proxy: Scheduled deferred FG resize {}x{}", _pendingResizeWidth, _pendingResizeHeight);
+        spdlog::default_logger()->flush();
+
+        if (State::Instance().activeFgOutput == FGOutput::FSRFG &&
+            Config::Instance()->FGUseMutexForSwapchain.value_or_default())
+        {
+            LOG_TRACE("Releasing ffxMutex: {}", State::Instance().currentFG->Mutex.getOwner());
+            State::Instance().currentFG->Mutex.unlockThis(3);
+        }
+
+        return result;
+    }
 
     WaitForGPUIdle(_device);
 
@@ -1347,4 +1861,311 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::SetHDRMetaData(DXGI_HDR_METADA
                                                                  void* pMetaData)
 {
     return _real4->SetHDRMetaData(Type, Size, pMetaData);
+}
+
+// ============================================================================
+// DX11 Frame Generation Proxy
+// ============================================================================
+
+bool WrappedIDXGISwapChain4::InitDx11FGProxy(IDXGISwapChain* fgSwapChain, ID3D11Device* dx11Dev,
+                                              ID3D12Device* dx12Dev, ID3D12CommandQueue* dx12Queue,
+                                              DXGI_SWAP_CHAIN_DESC* desc)
+{
+    if (!fgSwapChain || !dx11Dev || !dx12Dev || !dx12Queue || !desc)
+    {
+        LOG_ERROR("DX11 FG Proxy: Invalid parameters for initialization");
+        return false;
+    }
+
+    _fgSwapChain = fgSwapChain;       fgSwapChain->AddRef();
+    _proxyDx11Device = dx11Dev;        dx11Dev->AddRef();
+    _proxyDx12Device = dx12Dev;        dx12Dev->AddRef();
+    _proxyDx12Queue = dx12Queue;       dx12Queue->AddRef();
+    _proxyDesc = *desc;
+    _proxyBufferCount = std::max(desc->BufferCount, 2u);
+    if (_proxyBufferCount > 4)
+        _proxyBufferCount = 4;
+
+    // Create shared DX11 textures matching backbuffer format
+    D3D11_TEXTURE2D_DESC texDesc = {};
+    texDesc.Width = desc->BufferDesc.Width;
+    texDesc.Height = desc->BufferDesc.Height;
+    texDesc.Format = desc->BufferDesc.Format;
+    texDesc.MipLevels = 1;
+    texDesc.ArraySize = 1;
+    texDesc.SampleDesc = {1, 0};
+    texDesc.Usage = D3D11_USAGE_DEFAULT;
+    texDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    texDesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+
+    for (UINT i = 0; i < _proxyBufferCount; i++)
+    {
+        HRESULT hr = dx11Dev->CreateTexture2D(&texDesc, nullptr, &_proxyBuffers[i]);
+        if (FAILED(hr) || !_proxyBuffers[i])
+        {
+            LOG_ERROR("DX11 FG Proxy: Failed to create shared texture {} ({:X})", i, (UINT)hr);
+            CleanupDx11FGProxy();
+            return false;
+        }
+
+        // Get NT shared handle
+        IDXGIResource1* dxgiRes = nullptr;
+        hr = _proxyBuffers[i]->QueryInterface(IID_PPV_ARGS(&dxgiRes));
+        if (FAILED(hr) || !dxgiRes)
+        {
+            LOG_ERROR("DX11 FG Proxy: Failed to get IDXGIResource1 for texture {}", i);
+            CleanupDx11FGProxy();
+            return false;
+        }
+
+        hr = dxgiRes->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ, nullptr, &_proxySharedHandles[i]);
+        dxgiRes->Release();
+        if (FAILED(hr))
+        {
+            LOG_ERROR("DX11 FG Proxy: Failed to create shared handle for texture {} ({:X})", i, (UINT)hr);
+            CleanupDx11FGProxy();
+            return false;
+        }
+
+        // Open in DX12
+        hr = dx12Dev->OpenSharedHandle(_proxySharedHandles[i], IID_PPV_ARGS(&_proxyDx12Resources[i]));
+        if (FAILED(hr) || !_proxyDx12Resources[i])
+        {
+            LOG_ERROR("DX11 FG Proxy: Failed to open shared handle in DX12 for texture {} ({:X})", i, (UINT)hr);
+            CleanupDx11FGProxy();
+            return false;
+        }
+
+        LOG_INFO("DX11 FG Proxy: Shared texture {} created ({}x{}, fmt {})",
+                 i, texDesc.Width, texDesc.Height, (UINT)texDesc.Format);
+    }
+
+    // Create shared fence (DX11 → DX12 sync)
+    // ID3D11Device5 is needed for CreateFence
+    ID3D11Device5* dev5 = nullptr;
+    HRESULT hr = dx11Dev->QueryInterface(IID_PPV_ARGS(&dev5));
+    if (FAILED(hr) || !dev5)
+    {
+        LOG_ERROR("DX11 FG Proxy: ID3D11Device5 not available for fence creation");
+        CleanupDx11FGProxy();
+        return false;
+    }
+
+    hr = dev5->CreateFence(0, D3D11_FENCE_FLAG_SHARED, IID_PPV_ARGS(&_proxyDx11Fence));
+    dev5->Release();
+    if (FAILED(hr) || !_proxyDx11Fence)
+    {
+        LOG_ERROR("DX11 FG Proxy: Failed to create DX11 shared fence ({:X})", (UINT)hr);
+        CleanupDx11FGProxy();
+        return false;
+    }
+
+    hr = _proxyDx11Fence->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &_proxyFenceSharedHandle);
+    if (FAILED(hr))
+    {
+        LOG_ERROR("DX11 FG Proxy: Failed to create fence shared handle ({:X})", (UINT)hr);
+        CleanupDx11FGProxy();
+        return false;
+    }
+
+    hr = dx12Dev->OpenSharedHandle(_proxyFenceSharedHandle, IID_PPV_ARGS(&_proxyDx12Fence));
+    if (FAILED(hr) || !_proxyDx12Fence)
+    {
+        LOG_ERROR("DX11 FG Proxy: Failed to open fence in DX12 ({:X})", (UINT)hr);
+        CleanupDx11FGProxy();
+        return false;
+    }
+
+    // Create DX12 copy command infrastructure
+    hr = dx12Dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&_proxyCopyAllocator));
+    if (FAILED(hr))
+    {
+        LOG_ERROR("DX11 FG Proxy: Failed to create copy command allocator ({:X})", (UINT)hr);
+        CleanupDx11FGProxy();
+        return false;
+    }
+
+    hr = dx12Dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, _proxyCopyAllocator, nullptr,
+                                     IID_PPV_ARGS(&_proxyCopyCmdList));
+    if (FAILED(hr))
+    {
+        LOG_ERROR("DX11 FG Proxy: Failed to create copy command list ({:X})", (UINT)hr);
+        CleanupDx11FGProxy();
+        return false;
+    }
+    _proxyCopyCmdList->Close();
+
+    _dx11FGProxy = true;
+
+    // Store FG swapchain dimensions in State for UpscalerInputsDx11 to use.
+    // In DX11 proxy mode, feature->DisplayWidth() may differ from the actual FG swapchain
+    // (e.g., God of War: DLSS targets 3840x2160 internally, but swapchain is 1920x1080).
+    State::Instance().fgSwapchainWidth = desc->BufferDesc.Width;
+    State::Instance().fgSwapchainHeight = desc->BufferDesc.Height;
+
+    LOG_INFO("DX11 FG Proxy: Initialized successfully ({} buffers, {}x{})",
+             _proxyBufferCount, texDesc.Width, texDesc.Height);
+    return true;
+}
+
+void WrappedIDXGISwapChain4::CleanupDx11FGProxy()
+{
+    _dx11FGProxy = false;
+
+    if (_proxyCopyCmdList) { _proxyCopyCmdList->Release(); _proxyCopyCmdList = nullptr; }
+    if (_proxyCopyAllocator) { _proxyCopyAllocator->Release(); _proxyCopyAllocator = nullptr; }
+
+    // (waitable removed — Streamline's FG swapchain lacks FRAME_LATENCY_WAITABLE_OBJECT flag)
+
+    if (_proxyDx12Fence) { _proxyDx12Fence->Release(); _proxyDx12Fence = nullptr; }
+    if (_proxyFenceSharedHandle) { CloseHandle(_proxyFenceSharedHandle); _proxyFenceSharedHandle = nullptr; }
+    if (_proxyDx11Fence) { _proxyDx11Fence->Release(); _proxyDx11Fence = nullptr; }
+
+    for (UINT i = 0; i < 4; i++)
+    {
+        if (_proxyDx12Resources[i]) { _proxyDx12Resources[i]->Release(); _proxyDx12Resources[i] = nullptr; }
+        if (_proxySharedHandles[i]) { CloseHandle(_proxySharedHandles[i]); _proxySharedHandles[i] = nullptr; }
+        if (_proxyBuffers[i]) { _proxyBuffers[i]->Release(); _proxyBuffers[i] = nullptr; }
+    }
+
+    _proxyBufferCount = 0;
+    _proxyCurrentBuffer = 0;
+    if (_fgSwapChain) { _fgSwapChain->Release(); _fgSwapChain = nullptr; }
+    if (_proxyDx11Device) { _proxyDx11Device->Release(); _proxyDx11Device = nullptr; }
+    if (_proxyDx12Device) { _proxyDx12Device->Release(); _proxyDx12Device = nullptr; }
+    if (_proxyDx12Queue) { _proxyDx12Queue->Release(); _proxyDx12Queue = nullptr; }
+}
+
+HRESULT WrappedIDXGISwapChain4::Dx11FGProxyPresent(UINT SyncInterval, UINT Flags)
+{
+    // Menu overlay is rendered in Present() BEFORE this function is called,
+    // to keep ImGui's stack frames off the deep FG present call chain.
+    // ReflexHooks::update() is also already called in Present() — do NOT call it
+    // again here, as double-incrementing _updatesWithoutMarker causes FPS limit spam.
+
+    // 1. Signal DX11 fence after game finished rendering to proxy texture
+    ID3D11DeviceContext* ctx = nullptr;
+    _proxyDx11Device->GetImmediateContext(&ctx);
+    if (!ctx)
+    {
+        LOG_ERROR("DX11 FG Proxy: Failed to get immediate context");
+        return E_FAIL;
+    }
+
+    ID3D11DeviceContext4* ctx4 = nullptr;
+    ctx->QueryInterface(IID_PPV_ARGS(&ctx4));
+    ctx->Release();
+    if (!ctx4)
+    {
+        LOG_ERROR("DX11 FG Proxy: ID3D11DeviceContext4 not available");
+        return E_FAIL;
+    }
+
+    _proxyFenceValue++;
+    ctx4->Signal(_proxyDx11Fence, _proxyFenceValue);
+    ctx4->Flush();
+    ctx4->Release();
+
+    // 2. DX12 queue waits for DX11 rendering to complete
+    _proxyDx12Queue->Wait(_proxyDx12Fence, _proxyFenceValue);
+
+    // 3. Copy shared proxy texture → FG swapchain backbuffer
+    IDXGISwapChain3* fgSC3 = nullptr;
+    _fgSwapChain->QueryInterface(IID_PPV_ARGS(&fgSC3));
+    if (!fgSC3)
+    {
+        LOG_ERROR("DX11 FG Proxy: FG swapchain doesn't support IDXGISwapChain3");
+        return E_FAIL;
+    }
+
+    UINT bbIndex = fgSC3->GetCurrentBackBufferIndex();
+    ID3D12Resource* backBuffer = nullptr;
+    HRESULT hr = fgSC3->GetBuffer(bbIndex, IID_PPV_ARGS(&backBuffer));
+    fgSC3->Release();
+
+    if (FAILED(hr) || !backBuffer)
+    {
+        LOG_ERROR("DX11 FG Proxy: Failed to get FG backbuffer {} ({:X})", bbIndex, (UINT)hr);
+        return hr;
+    }
+
+    // DX11 game always renders to proxy buffer 0 (via GetBuffer(0) in BITBLT mode).
+    // Always copy from buffer 0 — do NOT cycle _proxyCurrentBuffer.
+    const UINT srcBuffer = 0;
+
+    // Record copy commands
+    _proxyCopyAllocator->Reset();
+    _proxyCopyCmdList->Reset(_proxyCopyAllocator, nullptr);
+
+    // Transition backbuffer: PRESENT → COPY_DEST
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = backBuffer;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    _proxyCopyCmdList->ResourceBarrier(1, &barrier);
+
+    // Copy proxy texture → backbuffer
+    // Shared resources from DX11 are in COMMON state (implicitly promoted)
+    _proxyCopyCmdList->CopyResource(backBuffer, _proxyDx12Resources[srcBuffer]);
+
+    // Transition backbuffer: COPY_DEST → PRESENT
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+    _proxyCopyCmdList->ResourceBarrier(1, &barrier);
+
+    _proxyCopyCmdList->Close();
+
+    ID3D12CommandList* cmdLists[] = {_proxyCopyCmdList};
+    _proxyDx12Queue->ExecuteCommandLists(1, cmdLists);
+    backBuffer->Release();
+
+    _frameCounter++;
+
+    // 4. Trigger present on the real DX12 swapchain
+    bool fgEnabled = Config::Instance()->FGEnabled.value_or_default();
+    HRESULT presentResult;
+    if (fgEnabled)
+    {
+        _fgDisableCooldown = 5; // Reset cooldown while FG is active
+        // Through FG hooks (hkFGPresent) which handles interpolation
+        presentResult = _fgSwapChain->Present(SyncInterval, Flags);
+        LOG_DEBUG("DX11 FG Proxy: FG Present result={:X}", (UINT)presentResult);
+    }
+    else if (_fgDisableCooldown > 0)
+    {
+        // Cooldown after FG disable: skip presenting on the FG swapchain
+        // for a few frames to let Streamline fully process its deactivation.
+        // CallOriginalPresent goes through Streamline's interposer which does
+        // heavy work during shutdown (root signature + pipeline state creation),
+        // adding enough stack depth to overflow the NVIDIA driver.
+        _fgDisableCooldown--;
+        LOG_DEBUG("DX11 FG Proxy: FG disable cooldown, {} frames remaining", _fgDisableCooldown);
+        presentResult = S_OK;
+    }
+    else
+    {
+        // Streamline has fully drained — safe to present directly
+        presentResult = FGHooks::CallOriginalPresent(_fgSwapChain, SyncInterval, Flags);
+        LOG_DEBUG("DX11 FG Proxy: Direct Present result={:X}", (UINT)presentResult);
+    }
+
+    // Vsync frame pacing: Streamline overrides all DLSSG presents to SyncInterval=0
+    // + DXGI_PRESENT_ALLOW_TEARING, removing all DXGI flip queue backpressure.
+    // WaitForVBlank restores display-synchronized pacing independently — it blocks
+    // until the display controller reaches vertical blank regardless of present mode.
+    IDXGIOutput* output = nullptr;
+    if (SUCCEEDED(_fgSwapChain->GetContainingOutput(&output)) && output)
+    {
+        output->WaitForVBlank();
+        output->Release();
+    }
+    else
+    {
+        // Fallback if GetContainingOutput fails (e.g., minimized window)
+        Sleep(1);
+    }
+
+    return presentResult;
 }

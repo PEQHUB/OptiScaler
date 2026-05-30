@@ -101,6 +101,19 @@ StyleCopReport.xml
 *.svclog
 *.scc
 
+# Local investigation handoffs and launch helpers
+/.forge-launch.sh
+/.pi-launch.sh
+/forge-local.bat
+/pi-local.bat
+/AUDIT_*.md
+/FRAMEWARP_*.md
+/HANDOFF_*.md
+/RESEARCH_NOTES.md
+/TODO_FrameWarp_*.md
+/DLSSG_VibeFlex2_Final_Analysis.md
+/read.md
+
 # Chutzpah Test files
 _Chutzpah*
 

@@ -5,6 +5,7 @@
 #include <Util.h>
 #include <Logger.h>
 #include <Config.h>
+#include <State.h>
 
 #include <imgui/imgui_impl_dx11.h>
 #include <imgui/imgui_impl_dx12.h>
@@ -498,7 +499,33 @@ static void RenderImGui_DX12(IDXGISwapChain* pSwapChainPlain)
                 g_pd3dCommandList->OMSetRenderTargets(1, &g_mainRenderTargetDescriptor[backBufferIdx], FALSE, NULL);
                 g_pd3dCommandList->SetDescriptorHeaps(1, &g_pd3dSrvDescHeap);
 
-                ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), g_pd3dCommandList);
+            // Frame Warp Debug Mask: transition _warpedOutput to pixel shader resource
+            if (State::Instance().frameWarpDebugMaskReady && State::Instance().frameWarpDebugMaskResource != nullptr)
+            {
+                D3D12_RESOURCE_BARRIER maskBarrier = {};
+                maskBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                maskBarrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+                maskBarrier.Transition.pResource = State::Instance().frameWarpDebugMaskResource;
+                maskBarrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                maskBarrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                maskBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                g_pd3dCommandList->ResourceBarrier(1, &maskBarrier);
+            }
+
+            ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), g_pd3dCommandList);
+
+            // Transition debug mask resource back to UAV for next frame
+            if (State::Instance().frameWarpDebugMaskReady && State::Instance().frameWarpDebugMaskResource != nullptr)
+            {
+                D3D12_RESOURCE_BARRIER maskBarrier = {};
+                maskBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                maskBarrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+                maskBarrier.Transition.pResource = State::Instance().frameWarpDebugMaskResource;
+                maskBarrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                maskBarrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                maskBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                g_pd3dCommandList->ResourceBarrier(1, &maskBarrier);
+            }
 
                 barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
                 barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
@@ -531,6 +558,21 @@ static void RenderImGui_DX12(IDXGISwapChain* pSwapChainPlain)
 }
 
 ID3D12GraphicsCommandList* MenuOverlayDx::MenuCommandList() { return g_pd3dCommandList; }
+
+ID3D12DescriptorHeap* MenuOverlayDx::GetSrvDescriptorHeap() {
+    return g_pd3dSrvDescHeap;
+}
+
+bool MenuOverlayDx::AllocateSrvDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE* outCpu, D3D12_GPU_DESCRIPTOR_HANDLE* outGpu) {
+    if (g_pd3dSrvDescHeap == nullptr || outCpu == nullptr || outGpu == nullptr)
+        return false;
+    g_pd3dSrvDescHeapAlloc.Alloc(outCpu, outGpu);
+    return true;
+}
+
+void MenuOverlayDx::FreeSrvDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE cpu, D3D12_GPU_DESCRIPTOR_HANDLE gpu) {
+    g_pd3dSrvDescHeapAlloc.Free(cpu, gpu);
+}
 
 void MenuOverlayDx::CleanupRenderTarget(bool clearQueue, HWND hWnd)
 {

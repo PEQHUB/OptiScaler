@@ -31,6 +31,48 @@ class FSRFG_Dx12 : public virtual IFGFeature_Dx12
     ID3D12GraphicsCommandList* _fgCommandList[BUFFER_COUNT] {};
     ID3D12CommandAllocator* _fgCommandAllocator[BUFFER_COUNT] {};
 
+    struct FrameWarpFrameContext
+    {
+        bool valid = false;
+        UINT64 frameID = 0;
+        ID3D12Resource* depth = nullptr;
+        D3D12_RESOURCE_STATES depthState = D3D12_RESOURCE_STATE_COMMON;
+        ID3D12Resource* hudless = nullptr;
+        D3D12_RESOURCE_STATES hudlessState = D3D12_RESOURCE_STATE_COMMON;
+        UINT width = 0;
+        UINT height = 0;
+        DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+        float vFovRadians = 0.0f;
+        float aspectRatio = 0.0f;
+        float cameraNear = 0.0f;
+        float cameraFar = 0.0f;
+        bool invertedDepth = false;
+        bool infiniteDepth = false;
+    };
+
+    FrameWarpFrameContext _frameWarpContexts[BUFFER_COUNT] {};
+    UINT64 _frameWarpPresentCallbackCounter = 0;
+    UINT64 _frameWarpLastGeneratedFrameID = 0;
+    UINT64 _frameWarpLastGeneratedCallback = 0;
+    UINT64 _frameWarpRealCallbacksSinceGenerated = 0;
+    UINT64 _frameWarpCadenceLogCount = 0;
+    UINT64 _frameWarpDiagGeneratedCallbacks = 0;
+    UINT64 _frameWarpDiagRealCallbacks = 0;
+    UINT64 _frameWarpDiagGeneratedWarped = 0;
+    UINT64 _frameWarpDiagRealWarped = 0;
+    UINT64 _frameWarpDiagCopies = 0;
+    UINT64 _frameWarpDiagStableUiApplied = 0;
+    UINT64 _frameWarpDiagNoopCopies = 0;
+    UINT64 _frameWarpDiagZeroPose = 0;
+    UINT64 _frameWarpDiagInvalidCopies = 0;
+    UINT64 _frameWarpDiagLastSummaryCallback = 0;
+    uint32_t _frameWarpDiagLastMode = UINT32_MAX;
+    bool _frameWarpGeneratedSeen = false;
+    UINT64 _frameWarpLatchedFrameID = 0;
+    bool _frameWarpLatchedDecisionValid = false;
+    bool _frameWarpLatchedWarped = false;
+    bool _frameWarpLatchedCopyOnly = false;
+
     static FfxApiResourceState GetFfxApiState(D3D12_RESOURCE_STATES state)
     {
         switch (state)
@@ -120,6 +162,7 @@ class FSRFG_Dx12 : public virtual IFGFeature_Dx12
     void SetCommandQueue(FG_ResourceType type, ID3D12CommandQueue* queue) override final;
 
     ffxReturnCode_t DispatchCallback(ffxDispatchDescFrameGeneration* params);
+    ffxReturnCode_t PresentCallback(ffxCallbackDescFrameGenerationPresent* params);
 
     FSRFG_Dx12() : IFGFeature_Dx12(), IFGFeature()
     {

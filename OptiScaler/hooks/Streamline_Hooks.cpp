@@ -14,6 +14,8 @@
 #include <sl1_reflex.h>
 #include <nvapi/fakenvapi.h>
 #include <inputs/FG/DLSSG_Mod.h>
+#include <framegen/dlssg/DLSSG_Native.h>
+#include <framewarp/FrameWarp.h>
 
 sl::RenderAPI StreamlineHooks::renderApi = sl::RenderAPI::eCount;
 std::mutex StreamlineHooks::setConstantsMutex {};
@@ -82,6 +84,143 @@ char* StreamlineHooks::trimStreamlineLog(const char* msg)
     }
 
     return result;
+}
+
+namespace
+{
+    bool IsNativeDLSSGTrackedTag(sl::BufferType type)
+    {
+        return type == sl::kBufferTypeHUDLessColor ||
+               type == sl::kBufferTypeDepth ||
+               type == sl::kBufferTypeHiResDepth ||
+               type == sl::kBufferTypeLinearDepth ||
+               type == sl::kBufferTypeUIColorAndAlpha;
+    }
+
+    void ObserveNativeDLSSGTag(const sl::ResourceTag& tag, sl::CommandBuffer* cmdBuffer, uint32_t frameId)
+    {
+        if (!DLSSGNative::IsAttachActive() || tag.resource == nullptr || tag.resource->native == nullptr)
+            return;
+
+        if (!IsNativeDLSSGTrackedTag(tag.type))
+            return;
+
+        auto& state = State::Instance();
+        state.dlssgNativeSetTagCount++;
+
+        auto* resource = reinterpret_cast<ID3D12Resource*>(tag.resource->native);
+        auto desc = resource->GetDesc();
+        const UINT width = tag.extent ? tag.extent.width : static_cast<UINT>(desc.Width);
+        const UINT height = tag.extent ? tag.extent.height : desc.Height;
+        const auto resourceState = static_cast<D3D12_RESOURCE_STATES>(tag.resource->state);
+
+        const bool depthTag = tag.type == sl::kBufferTypeDepth ||
+                              tag.type == sl::kBufferTypeHiResDepth ||
+                              tag.type == sl::kBufferTypeLinearDepth;
+        if (depthTag)
+        {
+            state.dlssgNativeDepthTagCount++;
+            FrameWarpRuntime::TrackDepthSource(resource, resourceState, width, height, desc.Format,
+                                               "native-dlssg-depth");
+            if (cmdBuffer != nullptr &&
+                Config::Instance()->FrameWarpEnabled.value_or_default() &&
+                Config::Instance()->FrameWarpDepthAware.value_or_default() &&
+                Config::Instance()->FrameWarpDLSSGMode.value_or_default() == 3)
+            {
+                FrameWarpRuntime::CaptureDepthSource(
+                    reinterpret_cast<ID3D12GraphicsCommandList*>(cmdBuffer),
+                    resource,
+                    resourceState,
+                    width,
+                    height,
+                    desc.Format,
+                    Config::Instance()->FGXeFGDepthInverted.value_or_default(),
+                    "native-dlssg-depth");
+            }
+        }
+        else if (tag.type == sl::kBufferTypeHUDLessColor)
+        {
+            state.dlssgNativeHudlessTagCount++;
+            if (cmdBuffer != nullptr)
+            {
+                FrameWarpRuntime::CaptureHudlessSource(reinterpret_cast<ID3D12GraphicsCommandList*>(cmdBuffer),
+                                                       resource, resourceState, width, height, desc.Format,
+                                                       "native-dlssg-hudless");
+            }
+        }
+        else if (tag.type == sl::kBufferTypeUIColorAndAlpha)
+        {
+            state.dlssgNativeUiTagCount++;
+        }
+
+        if (state.dlssgNativeSetTagCount <= 10 || state.dlssgNativeSetTagCount % 120 == 0)
+        {
+            LOG_DEBUG("Native DLSSG tag observed #{} type={} frame={} size={}x{} fmt={} depthTags={} hudlessTags={} uiTags={}",
+                      state.dlssgNativeSetTagCount,
+                      static_cast<uint32_t>(tag.type),
+                      frameId,
+                      width,
+                      height,
+                      static_cast<uint32_t>(desc.Format),
+                      state.dlssgNativeDepthTagCount,
+                      state.dlssgNativeHudlessTagCount,
+                      state.dlssgNativeUiTagCount);
+        }
+    }
+
+    void ObserveNativeDLSSGConstants(const sl::Constants& values, uint32_t frameId)
+    {
+        if (!DLSSGNative::IsAttachActive())
+            return;
+
+        auto& state = State::Instance();
+        state.dlssgNativeSetConstantsCount++;
+
+        if (values.cameraFOV > 0.0f && values.cameraAspectRatio > 0.0f)
+        {
+            FrameWarpRuntime::BeginDLSSGResourceFrameAnchor(
+                values.cameraFOV,
+                values.cameraAspectRatio,
+                "native-sl-constants");
+            FrameWarpRuntime::MarkFrameRenderStart("native-sl", values.cameraFOV, values.cameraAspectRatio);
+        }
+
+        Config::Instance()->FGXeFGDepthInverted = values.depthInverted == sl::Boolean::eTrue;
+
+        if (state.dlssgNativeSetConstantsCount <= 10 || state.dlssgNativeSetConstantsCount % 120 == 0)
+        {
+            LOG_DEBUG("Native DLSSG constants observed #{} frame={} fov={} aspect={} near={} far={} invertedDepth={}",
+                      state.dlssgNativeSetConstantsCount,
+                      frameId,
+                      values.cameraFOV,
+                      values.cameraAspectRatio,
+                      values.cameraNear,
+                      values.cameraFar,
+                      Config::Instance()->FGXeFGDepthInverted.value_or_default());
+        }
+    }
+
+    void ObserveNativeDLSSGEvaluate(sl::Feature feature, uint32_t frameId)
+    {
+        if (!DLSSGNative::IsAttachActive() || feature != sl::kFeatureDLSS_G)
+            return;
+
+        auto& state = State::Instance();
+        state.dlssgNativeEvaluateCount++;
+        state.dlssgNativeLastEvaluateFrame = state.frameCount;
+        state.DLSSGLastFrame = state.FGLastFrame;
+        ReflexHooks::setDlssgDetectedState(true);
+
+        if (state.dlssgNativeEvaluateCount <= 10 || state.dlssgNativeEvaluateCount % 120 == 0)
+        {
+            LOG_INFO("Native DLSSG evaluate observed #{} frameToken={} presentFrame={} mode={} path={}",
+                     state.dlssgNativeEvaluateCount,
+                     frameId,
+                     state.frameCount,
+                     DLSSGNative::ModeName(Config::Instance()->FGDLSSGNativeMode.value_or_default()),
+                     state.dlssgNativeLastPath[0] ? state.dlssgNativeLastPath : "unknown");
+        }
+    }
 }
 
 void StreamlineHooks::streamlineLogCallback(sl::LogType type, const char* msg)
@@ -180,7 +319,11 @@ sl::Result StreamlineHooks::hkslSetTag(const sl::ViewportHandle& viewport, const
             LOG_TRACE("Changing hudless resource state");
         }
 
-        if (State::Instance().activeFgInput == FGInput::DLSSG &&
+        if (DLSSGNative::IsAttachActive())
+        {
+            ObserveNativeDLSSGTag(tags[i], cmdBuffer, 0);
+        }
+        else if (State::Instance().activeFgInput == FGInput::DLSSG &&
             (tags[i].type == sl::kBufferTypeHUDLessColor || tags[i].type == sl::kBufferTypeDepth ||
              tags[i].type == sl::kBufferTypeHiResDepth || tags[i].type == sl::kBufferTypeLinearDepth ||
              tags[i].type == sl::kBufferTypeMotionVectors || tags[i].type == sl::kBufferTypeUIColorAndAlpha ||
@@ -227,7 +370,11 @@ sl::Result StreamlineHooks::hkslSetTagForFrame(const sl::FrameToken& frame, cons
             continue;
         }
 
-        if (State::Instance().activeFgInput == FGInput::DLSSG &&
+        if (DLSSGNative::IsAttachActive())
+        {
+            ObserveNativeDLSSGTag(resources[i], cmdBuffer, (uint32_t) frame);
+        }
+        else if (State::Instance().activeFgInput == FGInput::DLSSG &&
             (resources[i].type == sl::kBufferTypeHUDLessColor || resources[i].type == sl::kBufferTypeDepth ||
              resources[i].type == sl::kBufferTypeHiResDepth || resources[i].type == sl::kBufferTypeLinearDepth ||
              resources[i].type == sl::kBufferTypeMotionVectors || resources[i].type == sl::kBufferTypeUIColorAndAlpha ||
@@ -252,7 +399,21 @@ sl::Result StreamlineHooks::hkslEvaluateFeature(sl::Feature feature, const sl::F
 {
     LOG_DEBUG("frameIndex: {}", static_cast<uint32_t>(frame));
 
-    if (State::Instance().activeFgInput == FGInput::DLSSG && numInputs > 0 && inputs != nullptr)
+    ObserveNativeDLSSGEvaluate(feature, static_cast<uint32_t>(frame));
+
+    if (DLSSGNative::IsAttachActive() && numInputs > 0 && inputs != nullptr)
+    {
+        for (uint32_t i = 0; i < numInputs; i++)
+        {
+            if (inputs[i] == nullptr)
+                continue;
+
+            if (inputs[i]->structType == sl::ResourceTag::s_structType)
+                ObserveNativeDLSSGTag(*reinterpret_cast<const sl::ResourceTag*>(inputs[i]), cmdBuffer,
+                                      static_cast<uint32_t>(frame));
+        }
+    }
+    else if (State::Instance().activeFgInput == FGInput::DLSSG && numInputs > 0 && inputs != nullptr)
     {
         for (uint32_t i = 0; i < numInputs; i++)
         {
@@ -556,21 +717,27 @@ bool StreamlineHooks::hkdlssg_slOnPluginLoad(sl::param::IParameters* params, con
     // TODO: do it better than "static" and hoping for the best
     static std::string config;
 
+    bool isDlssgOutput = (State::Instance().activeFgOutput == FGOutput::DLSSG);
     bool shouldSpoofArch =
         Config::Instance()->StreamlineSpoofing.value_or_default() &&
-        (Config::Instance()->FGInput == FGInput::Nukems || Config::Instance()->FGInput == FGInput::DLSSG);
+        (Config::Instance()->FGInput == FGInput::Nukems || Config::Instance()->FGInput == FGInput::DLSSG ||
+         isDlssgOutput);
+
+    // For DLSSG output, ALWAYS ensure systemCaps->hwsSupported=true even if StreamlineSpoofing is off
+    bool needHwsSpoof = shouldSpoofArch || isDlssgOutput;
 
     uint32_t currentArch = 0;
-    if (shouldSpoofArch)
+    if (needHwsSpoof)
     {
         hookSystemCaps(params);
         currentArch = getSystemCapsArch();
-        spoofArch(currentArch, sl::kFeatureDLSS_G);
+        if (shouldSpoofArch)
+            spoofArch(currentArch, sl::kFeatureDLSS_G);
     }
 
     auto result = o_dlssg_slOnPluginLoad(params, loaderJSON, pluginJSON);
 
-    if (shouldSpoofArch)
+    if (needHwsSpoof)
         setArch(currentArch);
 
     nlohmann::json configJson = nlohmann::json::parse(*pluginJSON);
@@ -600,7 +767,8 @@ bool StreamlineHooks::hkdlssg_slOnPluginLoad(sl::param::IParameters* params, con
             configJson["external"]["vk"]["device"]["1.3_features"].clear();
     }
 
-    if (State::Instance().activeFgInput == FGInput::DLSSG || State::Instance().activeFgInput == FGInput::Nukems)
+    if (State::Instance().activeFgInput == FGInput::DLSSG || State::Instance().activeFgInput == FGInput::Nukems ||
+        State::Instance().activeFgOutput == FGOutput::DLSSG)
     {
         if (configJson.contains("/vsync/supported"_json_pointer))
             configJson["vsync"]["supported"] = true; // disable eVSyncOffRequired
@@ -634,7 +802,21 @@ sl::Result StreamlineHooks::hkslSetConstants(const sl::Constants& values, const 
     std::scoped_lock lock(setConstantsMutex);
     LOG_TRACE("called with frameIndex: {}, viewport: {}", (unsigned int) frame, (unsigned int) viewport);
 
-    State::Instance().slFGInputs.setConstants(values, (uint32_t) frame);
+    if (DLSSGNative::IsAttachActive())
+        ObserveNativeDLSSGConstants(values, (uint32_t) frame);
+    else
+    {
+        if (State::Instance().activeFgOutput == FGOutput::DLSSG &&
+            Config::Instance()->FrameWarpEnabled.value_or_default() &&
+            Config::Instance()->FrameWarpDLSSGMode.value_or_default() == 4)
+        {
+            FrameWarpRuntime::BeginDLSSGResourceFrameAnchor(
+                values.cameraFOV,
+                values.cameraAspectRatio,
+                "sl-constants");
+        }
+        State::Instance().slFGInputs.setConstants(values, (uint32_t) frame);
+    }
 
     return o_slSetConstants(values, frame, viewport);
 }
@@ -819,6 +1001,11 @@ void* StreamlineHooks::hkdlssg_slGetPluginFunction(const char* functionName)
         o_dlssg_slOnPluginLoad = (PFN_slOnPluginLoad) o_dlssg_slGetPluginFunction(functionName);
         return &hkdlssg_slOnPluginLoad;
     }
+
+    // When DLSSG is the FG output, we drive SL directly via SLProxy.
+    // Only intercept slOnPluginLoad (above) for JSON patching; pass through everything else.
+    if (State::Instance().activeFgOutput == FGOutput::DLSSG)
+        return o_dlssg_slGetPluginFunction(functionName);
 
     if (strcmp(functionName, "slDLSSGSetOptions") == 0)
     {
@@ -1158,7 +1345,8 @@ void StreamlineHooks::hookInterposer(HMODULE slInterposer)
                 DetourAttach(&(PVOID&) o_slInit, hkslInit);
 
                 bool hookSetTag = (State::Instance().activeFgInput == FGInput::Nukems ||
-                                   State::Instance().activeFgInput == FGInput::DLSSG);
+                                   State::Instance().activeFgInput == FGInput::DLSSG ||
+                                   DLSSGNative::IsAttachActive());
 
                 if (o_slSetTag != nullptr && hookSetTag)
                     DetourAttach(&(PVOID&) o_slSetTag, hkslSetTag);

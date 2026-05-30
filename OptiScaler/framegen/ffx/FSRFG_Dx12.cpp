@@ -3,6 +3,7 @@
 #include "FSRFG_Dx12.h"
 #include <State.h>
 
+#include <framewarp/FrameWarp.h>
 #include <hudfix/Hudfix_Dx12.h>
 #include <menu/menu_overlay_dx.h>
 
@@ -52,9 +53,86 @@ static D3D12_RESOURCE_STATES GetD3D12State(FfxApiResourceState state)
         return D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
     case FFX_API_RESOURCE_STATE_RENDER_TARGET:
         return D3D12_RESOURCE_STATE_RENDER_TARGET;
+    case FFX_API_RESOURCE_STATE_PRESENT:
+        return D3D12_RESOURCE_STATE_PRESENT;
     default:
         return D3D12_RESOURCE_STATE_COMMON;
     }
+}
+
+static void FSRFGFrameWarpTransitionResource(
+    ID3D12GraphicsCommandList* cmdList,
+    ID3D12Resource* resource,
+    D3D12_RESOURCE_STATES before,
+    D3D12_RESOURCE_STATES after)
+{
+    if (cmdList == nullptr || resource == nullptr || before == after)
+        return;
+
+    D3D12_RESOURCE_BARRIER barrier {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = resource;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = before;
+    barrier.Transition.StateAfter = after;
+    cmdList->ResourceBarrier(1, &barrier);
+}
+
+static bool FSRFGFrameWarpCopyResource(
+    ID3D12GraphicsCommandList* cmdList,
+    ID3D12Resource* destination,
+    D3D12_RESOURCE_STATES destinationState,
+    ID3D12Resource* source,
+    D3D12_RESOURCE_STATES sourceState)
+{
+    if (cmdList == nullptr || destination == nullptr || source == nullptr)
+        return false;
+
+    if (destination == source)
+        return true;
+
+    FSRFGFrameWarpTransitionResource(cmdList, source, sourceState, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    FSRFGFrameWarpTransitionResource(cmdList, destination, destinationState, D3D12_RESOURCE_STATE_COPY_DEST);
+
+    cmdList->CopyResource(destination, source);
+
+    FSRFGFrameWarpTransitionResource(cmdList, destination, D3D12_RESOURCE_STATE_COPY_DEST, destinationState);
+    FSRFGFrameWarpTransitionResource(cmdList, source, D3D12_RESOURCE_STATE_COPY_SOURCE, sourceState);
+    return true;
+}
+
+enum class FrameWarpFGDiagnosticMode : uint32_t
+{
+    Normal = 0,
+    CopyBoth = 1,
+    WarpGeneratedOnly = 2,
+    WarpRealOnly = 3,
+    WarpBothSameDelta = 4,
+    AutoCycle = 5,
+};
+
+static const char* FrameWarpFGDiagnosticModeName(uint32_t mode)
+{
+    switch (static_cast<FrameWarpFGDiagnosticMode>(mode))
+    {
+    case FrameWarpFGDiagnosticMode::Normal: return "normal";
+    case FrameWarpFGDiagnosticMode::CopyBoth: return "copy-both";
+    case FrameWarpFGDiagnosticMode::WarpGeneratedOnly: return "warp-all-latched";
+    case FrameWarpFGDiagnosticMode::WarpRealOnly: return "warp-all-latched";
+    case FrameWarpFGDiagnosticMode::WarpBothSameDelta: return "warp-all-latched";
+    case FrameWarpFGDiagnosticMode::AutoCycle: return "warp-all-latched";
+    default: return "unknown";
+    }
+}
+
+static uint32_t FrameWarpResolveFGDiagnosticMode(UINT64 callbackCounter)
+{
+    uint32_t configuredMode = Config::Instance()->FrameWarpFGDiagnosticMode.value_or_default();
+    if (configuredMode == static_cast<uint32_t>(FrameWarpFGDiagnosticMode::CopyBoth))
+        return configuredMode;
+
+    (void)callbackCounter;
+    return static_cast<uint32_t>(FrameWarpFGDiagnosticMode::WarpBothSameDelta);
 }
 
 inline static int GetFormatGroup(DXGI_FORMAT format)
@@ -317,22 +395,42 @@ bool FSRFG_Dx12::Dispatch()
 {
     LOG_FUNC();
 
+    auto& state = State::Instance();
+    auto config = Config::Instance();
+    const bool frameWarpFsrfgRequested = FrameWarpRuntime::IsFsrfgPresentCallbackRequested();
+
+    auto reportFrameWarpSkip = [&](const char* reason)
+    {
+        if (frameWarpFsrfgRequested)
+            FrameWarpRuntime::ReportFsrfgDispatchSkipped(reason);
+        LOG_DEBUG("FSRFG dispatch skipped: {}", reason != nullptr ? reason : "unknown");
+    };
+
     if (_fgContext == nullptr)
     {
-        LOG_DEBUG("No fg context");
+        reportFrameWarpSkip("no fg context");
+        return false;
+    }
+
+    if (!IsActive())
+    {
+        reportFrameWarpSkip("inactive");
+        return false;
+    }
+
+    if (IsPaused())
+    {
+        reportFrameWarpSkip("paused");
         return false;
     }
 
     UINT64 willDispatchFrame = 0;
-    auto fIndex = GetDispatchIndex(willDispatchFrame);
+    auto fIndex = GetDispatchIndex(willDispatchFrame, false);
     if (fIndex < 0)
+    {
+        reportFrameWarpSkip("already dispatched");
         return false;
-
-    if (!IsActive() || IsPaused())
-        return false;
-
-    auto& state = State::Instance();
-    auto config = Config::Instance();
+    }
 
     if (state.FSRFGFTPchanged)
         ConfigureFramePaceTuning();
@@ -345,7 +443,36 @@ bool FSRFG_Dx12::Dispatch()
         !_resourceReady[fIndex].at(FG_ResourceType::Velocity))
     {
         LOG_WARN("Depth or Velocity is not ready, skipping");
+        if (!_resourceReady[fIndex].contains(FG_ResourceType::Depth) ||
+            !_resourceReady[fIndex].at(FG_ResourceType::Depth))
+            reportFrameWarpSkip("missing depth");
+        else
+            reportFrameWarpSkip("missing velocity");
         return false;
+    }
+
+    UINT64 committedDispatchFrame = 0;
+    auto committedIndex = GetDispatchIndex(committedDispatchFrame, true);
+    if (committedIndex < 0)
+    {
+        reportFrameWarpSkip("commit failed");
+        return false;
+    }
+
+    willDispatchFrame = committedDispatchFrame;
+    fIndex = committedIndex;
+
+    const bool useFrameWarpPresentCallback =
+        frameWarpFsrfgRequested;
+
+    if (useFrameWarpPresentCallback)
+    {
+        static uint64_t fsrfgPresentPathLogCount = 0;
+        fsrfgPresentPathLogCount++;
+        if (fsrfgPresentPathLogCount <= 20 || fsrfgPresentPathLogCount % 300 == 0)
+        {
+            LOG_DEBUG("FrameWarp: FSRFG present callback path active; dispatch inputs left unwarped index={}", fIndex);
+        }
     }
 
     ffxConfigureDescFrameGeneration fgConfig = {};
@@ -384,6 +511,50 @@ bool FSRFG_Dx12::Dispatch()
     else
     {
         fgConfig.HUDLessColor = FfxApiResource({});
+    }
+
+    _frameWarpContexts[fIndex] = {};
+    if (useFrameWarpPresentCallback)
+    {
+        auto depthContextResource = GetResource(FG_ResourceType::Depth, fIndex);
+        if (depthContextResource != nullptr && IsResourceReady(FG_ResourceType::Depth, fIndex))
+        {
+            ID3D12Resource* depthResource = depthContextResource->GetResource();
+            ID3D12Resource* hudlessResource =
+                (hudless != nullptr && IsResourceReady(FG_ResourceType::HudlessColor, fIndex))
+                    ? hudless->GetResource()
+                    : nullptr;
+
+            if (depthResource != nullptr)
+            {
+                auto depthDesc = depthResource->GetDesc();
+                _frameWarpContexts[fIndex].valid = true;
+                _frameWarpContexts[fIndex].frameID = willDispatchFrame;
+                _frameWarpContexts[fIndex].depth = depthResource;
+                _frameWarpContexts[fIndex].depthState = depthContextResource->state;
+                _frameWarpContexts[fIndex].hudless = hudlessResource;
+                _frameWarpContexts[fIndex].hudlessState =
+                    (hudlessResource != nullptr) ? hudless->state : D3D12_RESOURCE_STATE_COMMON;
+                _frameWarpContexts[fIndex].width =
+                    static_cast<UINT>(_interpolationWidth[fIndex] != 0 ? _interpolationWidth[fIndex] : depthDesc.Width);
+                _frameWarpContexts[fIndex].height =
+                    _interpolationHeight[fIndex] != 0 ? _interpolationHeight[fIndex] : depthDesc.Height;
+                _frameWarpContexts[fIndex].format =
+                    (hudlessResource != nullptr) ? hudlessResource->GetDesc().Format : DXGI_FORMAT_UNKNOWN;
+                _frameWarpContexts[fIndex].vFovRadians = _cameraVFov[fIndex];
+                _frameWarpContexts[fIndex].aspectRatio = _cameraAspectRatio[fIndex];
+                _frameWarpContexts[fIndex].cameraNear = _cameraNear[fIndex];
+                _frameWarpContexts[fIndex].cameraFar = _cameraFar[fIndex];
+                _frameWarpContexts[fIndex].invertedDepth = IsInvertedDepth();
+                _frameWarpContexts[fIndex].infiniteDepth = IsInfiniteDepth();
+
+                if (auto frameWarp = FrameWarpRuntime::Get();
+                    frameWarp != nullptr && _cameraVFov[fIndex] > 0.0f && _cameraAspectRatio[fIndex] > 0.0f)
+                {
+                    frameWarp->SetCameraContext(_cameraVFov[fIndex], _cameraAspectRatio[fIndex], "fsrfg");
+                }
+            }
+        }
     }
 
     FfxApiProxy::D3D12_Configure(&_swapChainContext, &uiDesc.header);
@@ -459,12 +630,41 @@ bool FSRFG_Dx12::Dispatch()
         return FFX_API_RETURN_ERROR;
     };
 
+    if (useFrameWarpPresentCallback)
+    {
+        fgConfig.presentCallbackUserContext = this;
+        fgConfig.presentCallback = [](ffxCallbackDescFrameGenerationPresent* params, void* pUserCtx) -> ffxReturnCode_t
+        {
+            FSRFG_Dx12* fsrFG = nullptr;
+
+            if (pUserCtx != nullptr)
+                fsrFG = reinterpret_cast<FSRFG_Dx12*>(pUserCtx);
+
+            if (fsrFG != nullptr)
+                return fsrFG->PresentCallback(params);
+
+            return FFX_API_RETURN_ERROR;
+        };
+    }
+    else
+    {
+        fgConfig.presentCallbackUserContext = nullptr;
+        fgConfig.presentCallback = nullptr;
+    }
+
     fgConfig.onlyPresentGenerated = state.FGonlyGenerated;
     fgConfig.frameID = willDispatchFrame;
     fgConfig.swapChain = _swapChain;
 
     ffxReturnCode_t retCode = FfxApiProxy::D3D12_Configure(&_fgContext, &fgConfig.header);
     LOG_DEBUG("D3D12_Configure result: {0:X}, frame: {1}, fIndex: {2}", retCode, willDispatchFrame, fIndex);
+    if (useFrameWarpPresentCallback)
+    {
+        if (retCode == FFX_API_RETURN_OK)
+            FrameWarpRuntime::ReportFsrfgPresentCallbackConfigured(true, "present callback configured");
+        else
+            FrameWarpRuntime::ReportFsrfgDispatchSkipped("configure failed");
+    }
 
     ffxConfigureDescGlobalDebug1 fgLogging = {};
     fgLogging.header.type = FFX_API_CONFIGURE_DESC_TYPE_GLOBALDEBUG1;
@@ -707,6 +907,562 @@ ffxReturnCode_t FSRFG_Dx12::DispatchCallback(ffxDispatchDescFrameGeneration* par
     _lastFrameId = params->frameID;
 
     return dispatchResult;
+}
+
+ffxReturnCode_t FSRFG_Dx12::PresentCallback(ffxCallbackDescFrameGenerationPresent* params)
+{
+    if (params == nullptr)
+        return FFX_API_RETURN_ERROR;
+
+    auto cmdList = reinterpret_cast<ID3D12GraphicsCommandList*>(params->commandList);
+    auto currentBackBuffer = reinterpret_cast<ID3D12Resource*>(params->currentBackBuffer.resource);
+    auto outputSwapChainBuffer = reinterpret_cast<ID3D12Resource*>(params->outputSwapChainBuffer.resource);
+    auto currentUI = reinterpret_cast<ID3D12Resource*>(params->currentUI.resource);
+
+    if (cmdList == nullptr || currentBackBuffer == nullptr || outputSwapChainBuffer == nullptr)
+        return FFX_API_RETURN_ERROR;
+
+    D3D12_RESOURCE_STATES currentState = GetD3D12State((FfxApiResourceState) params->currentBackBuffer.state);
+    D3D12_RESOURCE_STATES outputState = GetD3D12State((FfxApiResourceState) params->outputSwapChainBuffer.state);
+    auto outputDesc = outputSwapChainBuffer->GetDesc();
+    auto sourceDesc = currentBackBuffer->GetDesc();
+    const bool isGeneratedFrame = params->isGeneratedFrame != 0;
+    FrameWarpRuntime::ReportFsrfgPresentCallbackSeen(params->frameID, isGeneratedFrame);
+
+    const bool enabled = FrameWarpRuntime::IsFsrfgPresentCallbackRequested();
+
+    if (!enabled)
+    {
+        return FSRFGFrameWarpCopyResource(cmdList, outputSwapChainBuffer, outputState, currentBackBuffer, currentState)
+                   ? FFX_API_RETURN_OK
+                   : FFX_API_RETURN_ERROR;
+    }
+
+    _frameWarpPresentCallbackCounter++;
+    const uint32_t requestedDiagnosticMode = Config::Instance()->FrameWarpFGDiagnosticMode.value_or_default();
+    const uint32_t effectiveDiagnosticMode = FrameWarpResolveFGDiagnosticMode(_frameWarpPresentCallbackCounter);
+    const bool diagnosticModeChanged = effectiveDiagnosticMode != _frameWarpDiagLastMode;
+    if (diagnosticModeChanged)
+    {
+        LOG_DEBUG("FrameWarp FSRFG diagnostic mode={} requested={} callback={} frameID={}",
+            FrameWarpFGDiagnosticModeName(effectiveDiagnosticMode),
+            FrameWarpFGDiagnosticModeName(requestedDiagnosticMode),
+            _frameWarpPresentCallbackCounter,
+            params->frameID);
+        _frameWarpDiagLastMode = effectiveDiagnosticMode;
+    }
+
+    if (isGeneratedFrame)
+    {
+        _frameWarpGeneratedSeen = true;
+        _frameWarpLastGeneratedFrameID = params->frameID;
+        _frameWarpLastGeneratedCallback = _frameWarpPresentCallbackCounter;
+        _frameWarpRealCallbacksSinceGenerated = 0;
+    }
+    else
+    {
+        _frameWarpRealCallbacksSinceGenerated++;
+    }
+
+    const bool realMatchesCurrentGenerated =
+        !isGeneratedFrame &&
+        _frameWarpGeneratedSeen &&
+        _frameWarpLastGeneratedFrameID == params->frameID &&
+        (_frameWarpPresentCallbackCounter - _frameWarpLastGeneratedCallback) <= 2;
+    const bool sameFrameLatched =
+        _frameWarpLatchedDecisionValid &&
+        _frameWarpLatchedFrameID == params->frameID;
+    bool shouldWarpThisCallback =
+        effectiveDiagnosticMode != static_cast<uint32_t>(FrameWarpFGDiagnosticMode::CopyBoth);
+    bool reuseLatchedWarpResult = sameFrameLatched && _frameWarpLatchedWarped;
+    const bool latchedCopyOnly = sameFrameLatched && _frameWarpLatchedCopyOnly;
+    const bool latchedZeroPose =
+        sameFrameLatched && !_frameWarpLatchedWarped && !_frameWarpLatchedCopyOnly;
+
+    auto markLatchedWarped = [&]()
+    {
+        _frameWarpLatchedFrameID = params->frameID;
+        _frameWarpLatchedDecisionValid = true;
+        _frameWarpLatchedWarped = true;
+        _frameWarpLatchedCopyOnly = false;
+        strncpy_s(State::Instance().frameWarpStatus.fsrfgLastPolicy, "warp-all-latched", _TRUNCATE);
+    };
+
+    auto markLatchedCopyOnly = [&]()
+    {
+        _frameWarpLatchedFrameID = params->frameID;
+        _frameWarpLatchedDecisionValid = true;
+        _frameWarpLatchedWarped = false;
+        _frameWarpLatchedCopyOnly = true;
+        strncpy_s(State::Instance().frameWarpStatus.fsrfgLastPolicy, "copy-frame", _TRUNCATE);
+    };
+
+    auto markLatchedZeroPose = [&]()
+    {
+        _frameWarpLatchedFrameID = params->frameID;
+        _frameWarpLatchedDecisionValid = true;
+        _frameWarpLatchedWarped = false;
+        _frameWarpLatchedCopyOnly = false;
+        strncpy_s(State::Instance().frameWarpStatus.fsrfgLastPolicy, "zero-pose", _TRUNCATE);
+    };
+
+    if (latchedCopyOnly)
+        shouldWarpThisCallback = false;
+
+    if (isGeneratedFrame)
+        _frameWarpDiagGeneratedCallbacks++;
+    else
+        _frameWarpDiagRealCallbacks++;
+
+    auto logDiagnosticStats = [&](const char* outcome)
+    {
+        const uint32_t summaryEvery = std::max<uint32_t>(
+            60,
+            Config::Instance()->FrameWarpFGDiagnosticCycleFrames.value_or_default());
+        if (diagnosticModeChanged ||
+            (_frameWarpPresentCallbackCounter - _frameWarpDiagLastSummaryCallback) >= summaryEvery)
+        {
+            LOG_DEBUG("FrameWarp FSRFG stats mode={} outcome={} callbacks={} gen={} real={} warpedGen={} warpedReal={} zeroPose={} copies={} invalidCopies={} noopCopies={} stableUI={} lastFrameID={} phase={} src={:X} dst={:X}",
+                FrameWarpFGDiagnosticModeName(effectiveDiagnosticMode),
+                outcome != nullptr ? outcome : "unknown",
+                _frameWarpPresentCallbackCounter,
+                _frameWarpDiagGeneratedCallbacks,
+                _frameWarpDiagRealCallbacks,
+                _frameWarpDiagGeneratedWarped,
+                _frameWarpDiagRealWarped,
+                _frameWarpDiagZeroPose,
+                _frameWarpDiagCopies,
+                _frameWarpDiagInvalidCopies,
+                _frameWarpDiagNoopCopies,
+                _frameWarpDiagStableUiApplied,
+                params->frameID,
+                isGeneratedFrame ? "generated" : "real",
+                (size_t) currentBackBuffer,
+                (size_t) outputSwapChainBuffer);
+            _frameWarpDiagLastSummaryCallback = _frameWarpPresentCallbackCounter;
+        }
+    };
+
+    _frameWarpCadenceLogCount++;
+    {
+        auto& fwStatus = State::Instance().frameWarpStatus;
+        const char* policyName =
+            shouldWarpThisCallback
+                ? (latchedZeroPose ? "zero-pose" : "warp-all-latched")
+                : "copy-frame";
+        fwStatus.fsrfgPresentCallbackOrdinal = _frameWarpPresentCallbackCounter;
+        fwStatus.fsrfgLastSourceResource = (uint64_t) currentBackBuffer;
+        fwStatus.fsrfgLastDestinationResource = (uint64_t) outputSwapChainBuffer;
+        fwStatus.fsrfgLastReuseFramePose = reuseLatchedWarpResult;
+        strncpy_s(fwStatus.fsrfgLastPhase, isGeneratedFrame ? "generated" : "real", _TRUNCATE);
+        strncpy_s(fwStatus.fsrfgLastPolicy, policyName, _TRUNCATE);
+    }
+
+    if (_frameWarpCadenceLogCount <= 80 || _frameWarpCadenceLogCount % 120 == 0 || diagnosticModeChanged)
+    {
+        const char* policyName =
+            shouldWarpThisCallback
+                ? (latchedZeroPose ? "zero-pose" : "warp")
+                : "copy";
+        LOG_DEBUG("FrameWarp FSRFG cadence #{} frameID={} phase={} mode={} policy={} pairedGenerated={} realSinceGenerated={} reuseFramePose={} src={:X} dst={:X} srcFmt={} dstFmt={} srcState={} dstState={}",
+            _frameWarpPresentCallbackCounter,
+            params->frameID,
+            isGeneratedFrame ? "generated" : "real",
+            FrameWarpFGDiagnosticModeName(effectiveDiagnosticMode),
+            policyName,
+            realMatchesCurrentGenerated,
+            _frameWarpRealCallbacksSinceGenerated,
+            reuseLatchedWarpResult,
+            (size_t) currentBackBuffer,
+            (size_t) outputSwapChainBuffer,
+            (UINT) sourceDesc.Format,
+            (UINT) outputDesc.Format,
+            (UINT) currentState,
+            (UINT) outputState);
+    }
+
+    if (!shouldWarpThisCallback)
+    {
+        markLatchedCopyOnly();
+        _frameWarpDiagCopies++;
+        if (_frameWarpCadenceLogCount <= 80 || _frameWarpCadenceLogCount % 120 == 0 || diagnosticModeChanged)
+        {
+            LOG_DEBUG("FrameWarp FSRFG phase={} copy frameID={} mode={} pairedGenerated={} realSinceGenerated={} reuseFramePose={} src={:X} dst={:X}",
+                isGeneratedFrame ? "generated" : "real",
+                params->frameID,
+                FrameWarpFGDiagnosticModeName(effectiveDiagnosticMode),
+                realMatchesCurrentGenerated,
+                _frameWarpRealCallbacksSinceGenerated,
+                reuseLatchedWarpResult,
+                (size_t) currentBackBuffer,
+                (size_t) outputSwapChainBuffer);
+        }
+
+        logDiagnosticStats("copy-frame");
+        return FSRFGFrameWarpCopyResource(cmdList, outputSwapChainBuffer, outputState, currentBackBuffer, currentState)
+                   ? FFX_API_RETURN_OK
+                   : FFX_API_RETURN_ERROR;
+    }
+
+    ID3D12Device* device = _device != nullptr ? _device : reinterpret_cast<ID3D12Device*>(params->device);
+
+    if (device == nullptr || outputDesc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        sourceDesc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+    {
+        markLatchedCopyOnly();
+        return FSRFGFrameWarpCopyResource(cmdList, outputSwapChainBuffer, outputState, currentBackBuffer, currentState)
+                   ? FFX_API_RETURN_OK
+                   : FFX_API_RETURN_ERROR;
+    }
+
+    FrameWarpRuntime::EnsureInitialized(
+        device,
+        static_cast<UINT>(outputDesc.Width),
+        outputDesc.Height,
+        outputDesc.Format);
+    FrameWarpRuntime::SyncConfig();
+
+    auto frameWarp = FrameWarpRuntime::Get();
+    if (frameWarp == nullptr || frameWarp->GetWarpedPresentOutput() == nullptr ||
+        frameWarp->GetOutputWidth() != static_cast<UINT>(outputDesc.Width) ||
+        frameWarp->GetOutputHeight() != outputDesc.Height ||
+        frameWarp->GetSourceFormat() != outputDesc.Format)
+    {
+        static uint64_t fallbackLogCount = 0;
+        fallbackLogCount++;
+        if (fallbackLogCount <= 20 || fallbackLogCount % 300 == 0)
+        {
+            LOG_DEBUG("FrameWarp: FSRFG present callback fallback copy; runtime mismatch output={}x{} fmt={} generated={} frameID={}",
+                outputDesc.Width,
+                outputDesc.Height,
+                (UINT) outputDesc.Format,
+                params->isGeneratedFrame,
+                params->frameID);
+        }
+
+        markLatchedCopyOnly();
+        return FSRFGFrameWarpCopyResource(cmdList, outputSwapChainBuffer, outputState, currentBackBuffer, currentState)
+                   ? FFX_API_RETURN_OK
+                   : FFX_API_RETURN_ERROR;
+    }
+
+    FrameWarpFrameContext* frameContext = nullptr;
+    const int directIndex = static_cast<int>(params->frameID % BUFFER_COUNT);
+    if (_frameWarpContexts[directIndex].valid && _frameWarpContexts[directIndex].frameID == params->frameID)
+    {
+        frameContext = &_frameWarpContexts[directIndex];
+    }
+    else
+    {
+        UINT64 bestDistance = UINT64_MAX;
+        for (int i = 0; i < BUFFER_COUNT; ++i)
+        {
+            if (!_frameWarpContexts[i].valid || _frameWarpContexts[i].frameID > params->frameID)
+                continue;
+
+            UINT64 distance = params->frameID - _frameWarpContexts[i].frameID;
+            if (distance < bestDistance)
+            {
+                bestDistance = distance;
+                frameContext = &_frameWarpContexts[i];
+            }
+        }
+
+        if (bestDistance > BUFFER_COUNT)
+            frameContext = nullptr;
+    }
+
+    ID3D12Resource* depthInput = frameContext != nullptr ? frameContext->depth : nullptr;
+    D3D12_RESOURCE_STATES depthState =
+        frameContext != nullptr ? frameContext->depthState : D3D12_RESOURCE_STATE_COMMON;
+    const bool depthSuppressedForFsrfgDisplay =
+        depthInput != nullptr && Config::Instance()->FrameWarpDepthAware.value_or_default();
+    if (depthSuppressedForFsrfgDisplay)
+    {
+        static uint64_t depthSuppressLogCount = 0;
+        depthSuppressLogCount++;
+        if (depthSuppressLogCount <= 20 || depthSuppressLogCount % 300 == 0 || diagnosticModeChanged)
+        {
+            LOG_DEBUG("FrameWarp: FSRFG depth input suppressed in present callback frameID={} phase={} because generated/currentBackBuffer depth cadence is not validated",
+                params->frameID,
+                isGeneratedFrame ? "generated" : "real");
+        }
+        strncpy_s(State::Instance().frameWarpStatus.lastDepthReason, "FSRFG depth suppressed", _TRUNCATE);
+        depthInput = nullptr;
+        depthState = D3D12_RESOURCE_STATE_COMMON;
+    }
+
+    if (frameContext != nullptr && frameContext->vFovRadians > 0.0f && frameContext->aspectRatio > 0.0f)
+        frameWarp->SetCameraContext(frameContext->vFovRadians, frameContext->aspectRatio, "fsrfg-present");
+
+    const bool hudfixEnabled = Config::Instance()->FGHUDFix.value_or_default();
+    bool stableUiAttempted = false;
+    bool stableUiApplied = false;
+    bool stableUiExtracted = false;
+    bool useHudlessSceneSource = false;
+    bool validHudlessForUi = false;
+
+    if (hudfixEnabled && frameContext != nullptr && frameContext->hudless != nullptr)
+    {
+        auto hudlessDesc = frameContext->hudless->GetDesc();
+        validHudlessForUi =
+            hudlessDesc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+            hudlessDesc.Width == outputDesc.Width &&
+            hudlessDesc.Height == outputDesc.Height &&
+            hudlessDesc.Format == outputDesc.Format &&
+            sourceDesc.Width == outputDesc.Width &&
+            sourceDesc.Height == outputDesc.Height &&
+            sourceDesc.Format == outputDesc.Format;
+
+        if (validHudlessForUi && !isGeneratedFrame)
+        {
+            stableUiAttempted = true;
+            stableUiExtracted = frameWarp->ExtractUiLayerFromHudless(
+                cmdList,
+                params->frameID,
+                frameContext->hudless,
+                frameContext->hudlessState,
+                currentBackBuffer,
+                currentState,
+                "hudfix-real");
+
+            useHudlessSceneSource = stableUiExtracted;
+
+            static uint64_t uiExtractAttemptLogCount = 0;
+            uiExtractAttemptLogCount++;
+            if (uiExtractAttemptLogCount <= 40 || uiExtractAttemptLogCount % 120 == 0 || diagnosticModeChanged)
+            {
+                LOG_DEBUG("FrameWarp UI extract phase=real source=hudfix-real frameID={} valid={} useHudlessScene={} explicitUi={}",
+                    params->frameID,
+                    stableUiExtracted,
+                    useHudlessSceneSource,
+                    currentUI != nullptr);
+            }
+        }
+        else if (!validHudlessForUi)
+        {
+            static uint64_t invalidHudlessLogCount = 0;
+            invalidHudlessLogCount++;
+            if (invalidHudlessLogCount <= 20 || invalidHudlessLogCount % 300 == 0)
+            {
+                LOG_DEBUG("FrameWarp UI extract skipped; hudless {}x{} fmt={} source {}x{} fmt={} output {}x{} fmt={}",
+                    hudlessDesc.Width,
+                    hudlessDesc.Height,
+                    (UINT) hudlessDesc.Format,
+                    sourceDesc.Width,
+                    sourceDesc.Height,
+                    (UINT) sourceDesc.Format,
+                    outputDesc.Width,
+                    outputDesc.Height,
+                    (UINT) outputDesc.Format);
+            }
+        }
+    }
+
+    ID3D12Resource* warpInput = useHudlessSceneSource ? frameContext->hudless : currentBackBuffer;
+    D3D12_RESOURCE_STATES warpInputState = useHudlessSceneSource ? frameContext->hudlessState : currentState;
+    const char* warpLabel =
+        useHudlessSceneSource
+            ? "fsrfg-hudless-real"
+            : (isGeneratedFrame ? "fsrfg-present-generated" : "fsrfg-present-real");
+
+    ID3D12Resource* warpedFrame = nullptr;
+    FrameWarp_Dx12::PresentResult presentResult = FrameWarp_Dx12::PresentResult::Invalid;
+    if (latchedZeroPose)
+    {
+        warpedFrame = warpInput;
+        presentResult = FrameWarp_Dx12::PresentResult::ZeroPose;
+    }
+    else
+    {
+        presentResult = frameWarp->OnPrePresentEx(
+            cmdList,
+            warpInput,
+            depthInput,
+            nullptr,
+            &warpedFrame,
+            warpInputState,
+            frameWarp->GetWarpedPresentOutput(),
+            depthState,
+            warpLabel,
+            reuseLatchedWarpResult);
+    }
+
+    const bool warped = presentResult == FrameWarp_Dx12::PresentResult::Warped && warpedFrame != nullptr;
+    const bool zeroPose = presentResult == FrameWarp_Dx12::PresentResult::ZeroPose && warpedFrame != nullptr;
+
+    if (warped || zeroPose)
+    {
+        if (warped)
+        {
+            markLatchedWarped();
+            if (isGeneratedFrame)
+                _frameWarpDiagGeneratedWarped++;
+            else
+                _frameWarpDiagRealWarped++;
+        }
+        else
+        {
+            markLatchedZeroPose();
+            _frameWarpDiagZeroPose++;
+        }
+
+        if (warped &&
+            warpInputState != D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE &&
+            warpInputState != D3D12_RESOURCE_STATE_COMMON)
+        {
+            FSRFGFrameWarpTransitionResource(
+                cmdList,
+                warpInput,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                warpInputState);
+        }
+
+        if (warped &&
+            depthInput != nullptr &&
+            depthState != D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE &&
+            depthState != D3D12_RESOURCE_STATE_COMMON)
+        {
+            FSRFGFrameWarpTransitionResource(
+                cmdList,
+                depthInput,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                depthState);
+        }
+
+        ID3D12Resource* sceneForUi = warped ? warpedFrame : warpInput;
+        D3D12_RESOURCE_STATES sceneForUiState =
+            warped ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : warpInputState;
+
+        const bool shouldTryCachedUi =
+            hudfixEnabled &&
+            ((isGeneratedFrame && !stableUiExtracted) || (!isGeneratedFrame && stableUiExtracted));
+        const bool suppressWarpedUiUnderlay =
+            isGeneratedFrame && !useHudlessSceneSource;
+        const bool useWarpTransformForUnderlay =
+            suppressWarpedUiUnderlay && warped;
+        const UINT64 uiMaxAge = isGeneratedFrame ? BUFFER_COUNT : 0;
+        if (shouldTryCachedUi)
+        {
+            stableUiApplied = frameWarp->CompositeCachedUiLayer(
+                cmdList,
+                params->frameID,
+                uiMaxAge,
+                sceneForUi,
+                sceneForUiState,
+                outputSwapChainBuffer,
+                outputState,
+                isGeneratedFrame ? "generated" : "real",
+                suppressWarpedUiUnderlay,
+                useWarpTransformForUnderlay);
+
+            if (stableUiApplied)
+            {
+                _frameWarpDiagStableUiApplied++;
+                static uint64_t stableUiCacheLogCount = 0;
+                stableUiCacheLogCount++;
+                if (stableUiCacheLogCount <= 40 || stableUiCacheLogCount % 120 == 0 || diagnosticModeChanged)
+                {
+                    LOG_DEBUG("FrameWarp: FSRFG UI layer composite phase={} frameID={} source={} poseResult={} suppressUnderlay={} repairWarp={} extractedThisFrame={} reuseFramePose={} reuseZeroPose={}",
+                        isGeneratedFrame ? "generated" : "real",
+                        params->frameID,
+                        isGeneratedFrame ? "real-cache" : "hudfix-real",
+                        warped ? "warped" : "zero-pose",
+                        suppressWarpedUiUnderlay,
+                        useWarpTransformForUnderlay,
+                        stableUiExtracted,
+                        reuseLatchedWarpResult,
+                        latchedZeroPose);
+                }
+
+                logDiagnosticStats(warped ? "ui-layer-warp" : "ui-layer-zero-pose");
+                return FFX_API_RETURN_OK;
+            }
+        }
+
+        if (zeroPose)
+        {
+            static uint64_t zeroPoseCopyLogCount = 0;
+            zeroPoseCopyLogCount++;
+            if (zeroPoseCopyLogCount <= 40 || zeroPoseCopyLogCount % 120 == 0 || diagnosticModeChanged)
+            {
+                LOG_DEBUG("FrameWarp FSRFG phase={} zero-pose copy frameID={} mode={} stableUiAttempted={} stableUiApplied={} reuseZeroPose={} src={:X} dst={:X}",
+                    isGeneratedFrame ? "generated" : "real",
+                    params->frameID,
+                    FrameWarpFGDiagnosticModeName(effectiveDiagnosticMode),
+                    stableUiAttempted,
+                    stableUiApplied,
+                    latchedZeroPose,
+                    (size_t) currentBackBuffer,
+                    (size_t) outputSwapChainBuffer);
+            }
+
+            logDiagnosticStats("zero-pose-copy");
+            return FSRFGFrameWarpCopyResource(cmdList, outputSwapChainBuffer, outputState, currentBackBuffer, currentState)
+                       ? FFX_API_RETURN_OK
+                       : FFX_API_RETURN_ERROR;
+        }
+
+        if (!FSRFGFrameWarpCopyResource(
+                cmdList,
+                outputSwapChainBuffer,
+                outputState,
+                warpedFrame,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+        {
+            return FFX_API_RETURN_ERROR;
+        }
+
+        static uint64_t presentWarpLogCount = 0;
+        presentWarpLogCount++;
+        if (presentWarpLogCount <= 40 || presentWarpLogCount % 120 == 0 || diagnosticModeChanged)
+        {
+            LOG_DEBUG("FrameWarp FSRFG phase={} warped frameID={} mode={} depth={} stableUiAttempted={} explicitUi={} reuseFramePose={} src={:X} dst={:X}",
+                isGeneratedFrame ? "generated" : "real",
+                params->frameID,
+                FrameWarpFGDiagnosticModeName(effectiveDiagnosticMode),
+                depthInput != nullptr,
+                stableUiAttempted,
+                currentUI != nullptr,
+                reuseLatchedWarpResult,
+                (size_t) warpInput,
+                (size_t) outputSwapChainBuffer);
+        }
+
+        if (currentUI != nullptr)
+        {
+            static uint64_t explicitUiLogCount = 0;
+            explicitUiLogCount++;
+            if (explicitUiLogCount <= 20 || explicitUiLogCount % 300 == 0)
+            {
+                LOG_DEBUG("FrameWarp: FSRFG explicit UI resource present but alpha composite is not yet enabled in callback path");
+            }
+        }
+
+        logDiagnosticStats("present-warp");
+        return FFX_API_RETURN_OK;
+    }
+
+    static uint64_t noWarpLogCount = 0;
+    noWarpLogCount++;
+    markLatchedCopyOnly();
+    _frameWarpDiagInvalidCopies++;
+    if (noWarpLogCount <= 40 || noWarpLogCount % 120 == 0 || diagnosticModeChanged)
+    {
+        LOG_DEBUG("FrameWarp: FSRFG present callback invalid copy frameID={} phase={} mode={} depth={} stableUiAttempted={} stableUiApplied={} reuseFramePose={}",
+            params->frameID,
+            isGeneratedFrame ? "generated" : "real",
+            FrameWarpFGDiagnosticModeName(effectiveDiagnosticMode),
+            depthInput != nullptr,
+            stableUiAttempted,
+            stableUiApplied,
+            reuseLatchedWarpResult);
+    }
+
+    logDiagnosticStats("invalid-copy");
+    return FSRFGFrameWarpCopyResource(cmdList, outputSwapChainBuffer, outputState, currentBackBuffer, currentState)
+               ? FFX_API_RETURN_OK
+               : FFX_API_RETURN_ERROR;
 }
 
 FSRFG_Dx12::~FSRFG_Dx12() { Shutdown(); }
@@ -1123,6 +1879,8 @@ void FSRFG_Dx12::Activate()
 {
     if (_fgContext != nullptr && _swapChain != nullptr && !_isActive)
     {
+        FrameWarpRuntime::ReportFsrfgPresentCallbackConfigured(false, "activating");
+
         ffxConfigureDescFrameGeneration fgConfig = {};
         fgConfig.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
         fgConfig.frameGenerationEnabled = true;
@@ -1145,6 +1903,30 @@ void FSRFG_Dx12::Activate()
 
 void FSRFG_Dx12::Deactivate()
 {
+    FrameWarpRuntime::ReportFsrfgPresentCallbackConfigured(false, "deactivated");
+
+    _frameWarpPresentCallbackCounter = 0;
+    _frameWarpLastGeneratedFrameID = 0;
+    _frameWarpLastGeneratedCallback = 0;
+    _frameWarpRealCallbacksSinceGenerated = 0;
+    _frameWarpCadenceLogCount = 0;
+    _frameWarpDiagGeneratedCallbacks = 0;
+    _frameWarpDiagRealCallbacks = 0;
+    _frameWarpDiagGeneratedWarped = 0;
+    _frameWarpDiagRealWarped = 0;
+    _frameWarpDiagCopies = 0;
+    _frameWarpDiagStableUiApplied = 0;
+    _frameWarpDiagNoopCopies = 0;
+    _frameWarpDiagZeroPose = 0;
+    _frameWarpDiagInvalidCopies = 0;
+    _frameWarpDiagLastSummaryCallback = 0;
+    _frameWarpDiagLastMode = UINT32_MAX;
+    _frameWarpGeneratedSeen = false;
+    _frameWarpLatchedFrameID = 0;
+    _frameWarpLatchedDecisionValid = false;
+    _frameWarpLatchedWarped = false;
+    _frameWarpLatchedCopyOnly = false;
+
     if (_isActive)
     {
         auto fIndex = GetIndex();
@@ -1154,7 +1936,10 @@ void FSRFG_Dx12::Deactivate()
             auto closeResult = _uiCommandList[fIndex]->Close();
 
             if (closeResult == S_OK)
+            {
                 _gameCommandQueue->ExecuteCommandLists(1, (ID3D12CommandList**) &_uiCommandList[fIndex]);
+                SignalUIFence(fIndex);
+            }
             else
                 LOG_ERROR("_uiCommandList[{}]->Close() error: {:X}", fIndex, (UINT) closeResult);
 
@@ -1328,6 +2113,7 @@ void FSRFG_Dx12::ReleaseObjects()
     _hudlessCompare.reset();
     _mvFlip.reset();
     _depthFlip.reset();
+    ReleaseUIFences();
 }
 
 bool FSRFG_Dx12::ExecuteCommandList(int index)
@@ -1345,7 +2131,7 @@ bool FSRFG_Dx12::ExecuteCommandList(int index)
 bool FSRFG_Dx12::SetResource(Dx12Resource* inputResource)
 {
     if (inputResource == nullptr || inputResource->resource == nullptr ||
-        (inputResource->type != FG_ResourceType::UIColor && (!IsActive() || IsPaused())))
+        (inputResource->type != FG_ResourceType::UIColor && inputResource->type != FG_ResourceType::Distortion && (!IsActive() || IsPaused())))
     {
         return false;
     }
@@ -1619,6 +2405,11 @@ void FSRFG_Dx12::CreateObjects(ID3D12Device* InDevice)
             }
         }
 
+        // Create fences for UI command allocator synchronization
+        if (!CreateUIFences())
+        {
+            LOG_ERROR("CreateUIFences failed");
+        }
     } while (false);
 }
 
@@ -1626,10 +2417,24 @@ bool FSRFG_Dx12::Present()
 {
     auto fIndex = GetIndexWillBeDispatched();
 
-    if (Config::Instance()->FGDrawUIOverFG.value_or_default())
+    bool drawUiOverFg = Config::Instance()->FGDrawUIOverFG.value_or_default();
+
+    if (drawUiOverFg)
     {
         auto ui = GetResource(FG_ResourceType::UIColor, fIndex);
-        if (ui != nullptr)
+        if (ui == nullptr)
+        {
+            static uint64_t missingUiLogCount = 0;
+            missingUiLogCount++;
+            if (missingUiLogCount <= 5 || missingUiLogCount % 600 == 0)
+            {
+                LOG_DEBUG("{} ignored: UI resource is nullptr",
+                    FrameWarpRuntime::IsFsrfgPresentCallbackRequested()
+                        ? "DrawUIOverFG under FrameWarp"
+                        : "DrawUIOverFG");
+            }
+        }
+        else
         {
             LOG_DEBUG("UI[{}] resource: {:X}, copy: {}", fIndex, (size_t) ui->resource, (size_t) ui->copy);
             if (_renderUI.get() == nullptr)
@@ -1651,10 +2456,6 @@ bool FSRFG_Dx12::Present()
                     _renderUI->Dispatch((IDXGISwapChain3*) _swapChain, commandList, ui->GetResource(), ui->state);
                 }
             }
-        }
-        else if (ui == nullptr)
-        {
-            LOG_WARN("UI resource is nullptr");
         }
     }
 
@@ -1689,7 +2490,10 @@ bool FSRFG_Dx12::Present()
             auto closeResult = _uiCommandList[fIndex]->Close();
 
             if (closeResult == S_OK)
+            {
                 _gameCommandQueue->ExecuteCommandLists(1, (ID3D12CommandList**) &_uiCommandList[fIndex]);
+                SignalUIFence(fIndex);
+            }
             else
                 LOG_ERROR("_uiCommandList[{}]->Close() error: {:X}", fIndex, (UINT) closeResult);
 
