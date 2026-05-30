@@ -40,6 +40,195 @@
 
 **OptiScaler** is a tool that lets you replace upscalers in games that ***already support DLSS2+ / FSR2+ / XeSS*** ($`^1`$), as well as manage ***frame generation*** in already mentioned games _(either by replacing existing FG options or enabling it in DX12 games through experimental ***OptiFG***)_. It also offers extensive customization options for all users, including those with Nvidia GPUs using DLSS.
 
+## PEQHUB VibeFlex2 / DLSSG Experimental Fork
+
+This fork contains experimental work for running **VibeFlex2 / FrameWarp** with **DLSS Frame Generation**.
+
+It is not a normal upstream OptiScaler release. Treat it as a compatibility/testing build for DLSSG latency experiments.
+
+The main experimental path is:
+
+- DLSSG output through NVIDIA Streamline
+- VibeFlex2 enabled through `[FrameWarp]`
+- DLSSG resource-copy warp through `DLSSGMode=4`
+- Optional HUDFix support to keep UI stable while warping the scene
+
+### What This Is For
+
+VibeFlex2 tries to reduce mouse-look latency by applying a small late camera correction after the game has rendered.
+
+For normal rendering this is relatively direct. For DLSS Frame Generation it is harder, because DLSSG creates extra frames internally. This fork adds an experimental resource-level hook that tries to warp the DLSSG output texture before it reaches presentation.
+
+### Current Limitations
+
+- This is experimental.
+- Native Streamline games may not expose the same DLSSG copy pattern.
+- MFG is not fully solved yet. In 2x/3x/4x MFG, VibeFlex2 may only affect some displayed frames unless a per-generated-frame hook is found.
+- UI stability depends on the HUDFix path working correctly for the game.
+- Do not use this in online or anti-cheat protected games.
+
+### Required OptiScaler Files
+
+Copy the full release folder contents into the game executable folder. Do not copy only `dxgi.dll`.
+
+At minimum, the game folder should contain:
+
+```text
+dxgi.dll
+OptiScaler.ini
+amd_fidelityfx_dx12.dll
+amd_fidelityfx_framegeneration_dx12.dll
+amd_fidelityfx_upscaler_dx12.dll
+amd_fidelityfx_vk.dll
+libxess.dll
+libxess_dx11.dll
+libxess_fg.dll
+libxell.dll
+D3D12_Optiscaler/
+Licenses/
+```
+
+The built release folder is usually:
+
+```text
+x64/Release/a/
+```
+
+The proxy DLL should be named according to the game/API. For most DX12 testing, use:
+
+```text
+dxgi.dll
+```
+
+### Required DLSSG / Streamline Files
+
+For DLSSG output, OptiScaler needs NVIDIA Streamline and DLSSG runtime files available next to the game.
+
+For OptiScaler-owned DLSSG output, place the Streamline files in a `sl` subfolder next to `dxgi.dll`:
+
+```text
+sl/sl.interposer.dll
+sl/sl.common.dll
+sl/sl.dlss_g.dll
+sl/sl.reflex.dll
+sl/sl.pcl.dll
+```
+
+Also provide the DLSSG NGX runtime:
+
+```text
+nvngx_dlssg.dll
+```
+
+Recommended optional NGX files, depending on the game and feature path:
+
+```text
+nvngx_dlss.dll
+nvngx_dlssd.dll
+```
+
+Typical folder shape:
+
+```text
+GameFolder/
+  dxgi.dll
+  OptiScaler.ini
+  nvngx_dlssg.dll
+  nvngx_dlss.dll
+  sl/
+    sl.interposer.dll
+    sl.common.dll
+    sl.dlss_g.dll
+    sl.reflex.dll
+    sl.pcl.dll
+```
+
+For **Streamline-native games**, the game may already ship its own Streamline stack. In that case, do not blindly overwrite the game's files. The important files to look for are:
+
+```text
+sl.interposer.dll
+sl.common.dll
+sl.dlss_g.dll
+sl.reflex.dll
+sl.pcl.dll
+nvngx_dlssg.dll
+```
+
+If the game already loads these, this fork can attach to the native Streamline path. If the game does not expose the expected DLSSG resource-copy pattern, VibeFlex2 mode 4 may not activate even when DLSSG itself works.
+
+### Recommended DLSSG + VibeFlex2 Test Config
+
+Start with this in `OptiScaler.ini`:
+
+```ini
+[FrameGen]
+FGOutput=dlssg
+
+[DLSSG]
+NativeMode=auto
+
+[FrameWarp]
+Enabled=true
+WithFG=true
+DLSSGMode=4
+DLSSGUnsafeLiveWarp=false
+TimingAuditLog=true
+Debug=true
+DebugViewMode=1
+
+[OptiFG]
+HUDFix=true
+```
+
+For first-run diagnostics, keep:
+
+```ini
+TimingAuditLog=true
+Debug=true
+DebugViewMode=1
+```
+
+After confirming the path works, diagnostics can be reduced:
+
+```ini
+TimingAuditLog=false
+Debug=false
+DebugViewMode=0
+```
+
+### Expected Log Signs
+
+A working DLSSG resource-warp path should show lines similar to:
+
+```text
+FrameWarp.Enabled(resolved): true
+FrameWarp.WithFG(resolved): true
+FrameWarp.DLSSGMode: 4
+VF2DLSSGResourceWarpCandidate ... accepted=true
+VF2DLSSGResourceWarp ... applied=true
+```
+
+If VibeFlex2 is not active, check for:
+
+```text
+reason=framewarp disabled
+reason=mode4-ui-cache-required
+accepted=false
+applied=false
+```
+
+If there are no `VF2DLSSGResourceWarpCandidate` lines at all, the game probably is not exposing the DLSSG resource-copy path this fork currently hooks.
+
+### Safe Defaults
+
+Leave this disabled for normal testing:
+
+```ini
+DLSSGUnsafeLiveWarp=false
+```
+
+The older late-present DLSSG warp path can cause jitter because it may warp the wrong DLSSG phase. Mode 4 is the preferred experimental path because it targets the DLSSG resource-copy stage instead of the final DXGI present.
+
 > [!CAUTION]
 > * We've been informed about some **FAKE websites** presenting themselves as OptiScaler team, so we would like to strongly highlight that we **DO NOT HAVE an official website!**  
 > * Only **LEGIT places** are this Github, our Discord server and Nitec's NexusMods page.  
