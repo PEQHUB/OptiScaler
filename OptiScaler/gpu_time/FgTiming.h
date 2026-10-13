@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -9,15 +10,23 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace FgTiming
 {
 using Clock = std::chrono::steady_clock;
 
+enum class Coverage
+{
+    Full,
+    Partial
+};
+
 struct Snapshot
 {
     std::string backend;
     std::string scope;
+    Coverage coverage = Coverage::Full;
     std::optional<double> milliseconds;
     std::optional<double> averageMilliseconds;
     uint64_t frameId = 0;
@@ -33,6 +42,7 @@ class Channel
     mutable std::mutex _mutex;
     std::string _backend;
     std::string _scope;
+    Coverage _coverage;
     uint64_t _epoch = 1;
     uint64_t _lastFrameId = 0;
     uint32_t _generatedFrames = 0;
@@ -43,7 +53,10 @@ class Channel
     static constexpr size_t HistorySize = 64;
     static constexpr auto MaxSampleAge = std::chrono::seconds(1);
 
-    Channel(std::string backend, std::string scope) : _backend(std::move(backend)), _scope(std::move(scope)) {}
+    Channel(std::string backend, std::string scope, Coverage coverage = Coverage::Full)
+        : _backend(std::move(backend)), _scope(std::move(scope)), _coverage(coverage)
+    {
+    }
 
     uint64_t Epoch() const
     {
@@ -86,6 +99,7 @@ class Channel
         Snapshot result;
         result.backend = _backend;
         result.scope = _scope;
+        result.coverage = _coverage;
         result.frameId = _lastFrameId;
         result.generatedFrames = _generatedFrames;
         result.sampleCount = _samples.size();
@@ -104,6 +118,42 @@ class Channel
             sum += sample;
         result.averageMilliseconds = sum / static_cast<double>(_samples.size());
         return result;
+    }
+};
+
+// Declare a batch before collector locks. Its destructor publishes after those locks are released,
+// in frame order regardless of query-slot or hash-table order. The channel still rejects old epochs,
+// duplicates and results older than a sample published by an earlier batch.
+class CompletedSamples
+{
+    struct Result
+    {
+        std::shared_ptr<Channel> channel;
+        uint64_t epoch;
+        uint64_t frameId;
+        double milliseconds;
+        uint32_t generatedFrames;
+    };
+    std::vector<Result> _results;
+
+  public:
+    CompletedSamples() = default;
+    CompletedSamples(const CompletedSamples&) = delete;
+    CompletedSamples& operator=(const CompletedSamples&) = delete;
+
+    void Add(std::shared_ptr<Channel> channel, uint64_t epoch, uint64_t frameId, double milliseconds,
+             uint32_t generatedFrames = 0)
+    {
+        if (channel)
+            _results.push_back({ std::move(channel), epoch, frameId, milliseconds, generatedFrames });
+    }
+
+    ~CompletedSamples()
+    {
+        std::stable_sort(_results.begin(), _results.end(),
+                         [](const Result& a, const Result& b) { return a.frameId < b.frameId; });
+        for (auto& result : _results)
+            result.channel->Publish(result.epoch, result.frameId, result.milliseconds, result.generatedFrames);
     }
 };
 

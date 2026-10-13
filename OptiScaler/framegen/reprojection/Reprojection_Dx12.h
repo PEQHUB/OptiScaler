@@ -9,6 +9,7 @@ class Reprojection_Dx12 : public virtual IFGFeature_Dx12
   protected:
     void ReleaseObjects() override final;
     void CreateObjects(ID3D12Device* InDevice) override final;
+    void OnSCCommandListReset(int index) override final;
 
   public:
     // IFGFeature

@@ -8750,7 +8750,7 @@ void MenuCommon::RenderUpscalerTimeGraph(RenderMenuContext& ctx)
     if (!gFgTimingActive)
         ImGui::TextDisabled("| FG: Off");
     else if (gFgTiming.milliseconds)
-        ImGui::Text(gFgTiming.scope.find("(partial)") != std::string::npos ? "| FG*: %.2fms" : "| FG: %.2fms",
+        ImGui::Text(gFgTiming.coverage == FgTiming::Coverage::Partial ? "| FG*: %.2fms" : "| FG: %.2fms",
                     *gFgTiming.milliseconds);
     else
         ImGui::TextDisabled("| FG: N/A");

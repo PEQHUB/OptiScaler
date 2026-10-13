@@ -10,4 +10,8 @@ if errorlevel 1 exit /b 1
 cl /nologo /std:c++20 /EHsc /W4 /WX /fp:precise tests\FgTimingTests.cpp /Fo:tests\out\FgTimingTests.obj /Fe:tests\out\FgTimingTests.exe
 if errorlevel 1 exit /b 1
 tests\out\FgTimingTests.exe
+if errorlevel 1 exit /b 1
+cl /nologo /std:c++20 /EHsc /W4 /WX /fp:precise tests\FgTimingLifecycleTests.cpp /Fo:tests\out\FgTimingLifecycleTests.obj /Fe:tests\out\FgTimingLifecycleTests.exe
+if errorlevel 1 exit /b 1
+tests\out\FgTimingLifecycleTests.exe
 exit /b %errorlevel%

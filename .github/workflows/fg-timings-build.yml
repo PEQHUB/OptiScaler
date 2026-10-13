@@ -23,7 +23,7 @@ jobs:
         with:
           submodules: true
       - uses: microsoft/setup-msbuild@v3
-      - name: Test timing validity and history
+      - name: Test timing validity and collector lifecycle
         shell: cmd
         run: tests\Run-FgTimingTests.cmd
       - name: Build x64 Release DLL

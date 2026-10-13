@@ -9,6 +9,11 @@
 
 #include <magic_enum.hpp>
 
+void Reprojection_Dx12::OnSCCommandListReset(int index)
+{
+    FgGpuTime_Dx12::BindOwnedRecording(_scCommandList[index], _scCommandAllocator[index]);
+}
+
 void Reprojection_Dx12::ReleaseObjects()
 {
     for (size_t i = 0; i < BUFFER_COUNT; i++)
@@ -306,7 +311,8 @@ bool Reprojection_Dx12::Present()
                 std::memcpy(data.cameraPrevForward, _cameraForward[previousIndex], 3 * sizeof(float));
 
                 _reproject->FilloutStruct(data, params);
-                ScopedFgGpuTime_Dx12 timing(commandList, _gpuTiming, ++_gpuTimingSequence);
+                ScopedFgGpuTime_Dx12 timing(commandList, _gpuTiming, ++_gpuTimingSequence, 0,
+                                            ScopedFgGpuTime_Dx12::RecordingMode::Owned);
                 const auto dispatched =
                     _reproject->Dispatch((IDXGISwapChain3*) _swapChain, commandList, params, hudless->GetResource(),
                                          hudless->state, depth->GetResource(), depth->state);
@@ -328,7 +334,7 @@ bool Reprojection_Dx12::Present()
     if (_scCommandListResetted[fIndex])
     {
         if (_scCommandList[fIndex]->Close() == S_OK)
-            _gameCommandQueue->ExecuteCommandLists(1, (ID3D12CommandList**) &_scCommandList[fIndex]);
+            FgGpuTime_Dx12::SubmitOwnedRecording(_gameCommandQueue, _scCommandList[fIndex]);
 
         _scCommandListResetted[fIndex] = false;
     }

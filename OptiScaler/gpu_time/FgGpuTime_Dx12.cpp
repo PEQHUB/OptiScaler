@@ -135,6 +135,7 @@ class PrivateData : public IUnknown
 class RecordingData final : public PrivateData
 {
   public:
+    ScopedFgGpuTime_Dx12::RecordingMode mode = ScopedFgGpuTime_Dx12::RecordingMode::Observed;
     bool active = true;
     bool closed = false;
     bool closeSucceeded = false;
@@ -285,7 +286,7 @@ HRESULT STDMETHODCALLTYPE ObserveReset(ID3D12GraphicsCommandList* list, ID3D12Co
     if (SUCCEEDED(result))
     {
         auto recording = GetData<RecordingData>(list, RecordingGuid);
-        if (recording)
+        if (recording && recording->mode == ScopedFgGpuTime_Dx12::RecordingMode::Observed)
         {
             {
                 std::lock_guard lock(GetPool().mutex);
@@ -308,7 +309,7 @@ HRESULT STDMETHODCALLTYPE ObserveClose(ID3D12GraphicsCommandList* list)
 {
     auto result = originalClose(list);
     auto recording = GetData<RecordingData>(list, RecordingGuid);
-    if (recording)
+    if (recording && recording->mode == ScopedFgGpuTime_Dx12::RecordingMode::Observed)
     {
         std::lock_guard lock(GetPool().mutex);
         recording->closed = true;
@@ -320,37 +321,9 @@ HRESULT STDMETHODCALLTYPE ObserveClose(ID3D12GraphicsCommandList* list)
     return result;
 }
 
-void STDMETHODCALLTYPE ObserveExecute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists)
+void ExecuteRecordings(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists,
+                       const std::vector<ComPtr<RecordingData>>& recordings, ExecuteFn execute)
 {
-    if (liveRecordings.load() == 0 || !lists)
-    {
-        originalExecute(queue, count, lists);
-        return;
-    }
-
-    std::vector<ComPtr<RecordingData>> recordings;
-    for (UINT index = 0; index < count; ++index)
-    {
-        if (lists[index])
-        {
-            auto recording = GetData<RecordingData>(lists[index], RecordingGuid);
-            if (recording)
-                recordings.push_back(std::move(recording));
-        }
-    }
-    if (recordings.empty())
-    {
-        originalExecute(queue, count, lists);
-        return;
-    }
-
-    auto timeline = GetTimeline(queue);
-    // One queue owns one fence timeline. Serialize only tagged execute+signal
-    // pairs so two CPU submitters cannot assign/signals values out of order.
-    std::unique_lock<std::mutex> submitLock;
-    if (timeline)
-        submitLock = std::unique_lock(timeline->submitMutex);
-
     std::vector<std::shared_ptr<Sample>> samples;
     auto& pool = GetPool();
     {
@@ -368,7 +341,22 @@ void STDMETHODCALLTYPE ObserveExecute(ID3D12CommandQueue* queue, UINT count, ID3
         }
     }
 
-    originalExecute(queue, count, lists);
+    // A previously timed list keeps metadata after Reset even when its new recording is untimed.
+    // Such submissions need neither a timeline/fence allocation nor an extra queue operation.
+    if (samples.empty())
+    {
+        execute(queue, count, lists);
+        return;
+    }
+
+    auto realQueue = Canonical(queue);
+    auto timeline = realQueue ? GetTimeline(realQueue.Get()) : nullptr;
+    // One queue owns one fence timeline. Serialize only measured execute+signal pairs.
+    std::unique_lock<std::mutex> submitLock;
+    if (timeline)
+        submitLock = std::unique_lock(timeline->submitMutex);
+
+    execute(queue, count, lists);
 
     const UINT64 value = timeline && timeline->nextValue != UINT64_MAX ? ++timeline->nextValue : 0;
     const bool signalled = value != 0 && SUCCEEDED(queue->Signal(timeline->fence.Get(), value));
@@ -399,6 +387,35 @@ void STDMETHODCALLTYPE ObserveExecute(ID3D12CommandQueue* queue, UINT count, ID3
             }
         }
     }
+}
+
+void STDMETHODCALLTYPE ObserveExecute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists)
+{
+    if (liveRecordings.load() == 0 || !lists)
+    {
+        originalExecute(queue, count, lists);
+        return;
+    }
+
+    std::vector<ComPtr<RecordingData>> recordings;
+    for (UINT index = 0; index < count; ++index)
+    {
+        if (lists[index])
+        {
+            auto recording = GetData<RecordingData>(lists[index], RecordingGuid);
+            if (recording && recording->mode == ScopedFgGpuTime_Dx12::RecordingMode::Observed)
+                recordings.push_back(std::move(recording));
+        }
+    }
+    if (recordings.empty())
+        originalExecute(queue, count, lists);
+    else
+        ExecuteRecordings(queue, count, lists, recordings, originalExecute);
+}
+
+void STDMETHODCALLTYPE ExecuteNativeQueue(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists)
+{
+    queue->ExecuteCommandLists(count, lists);
 }
 
 bool HookList(ID3D12GraphicsCommandList* list)
@@ -566,12 +583,15 @@ struct ScopedFgGpuTime_Dx12::Impl
 
 ScopedFgGpuTime_Dx12::ScopedFgGpuTime_Dx12(ID3D12GraphicsCommandList* commandList,
                                            const std::shared_ptr<FgTiming::Channel>& channel, uint64_t frameId,
-                                           uint32_t generatedFrames)
+                                           uint32_t generatedFrames, RecordingMode mode)
 {
     if (!commandList || !channel || frameId == 0)
         return;
     auto list = Canonical(commandList);
-    if (!HookList(list.Get()))
+    auto recording = GetData<RecordingData>(list.Get(), RecordingGuid);
+    if ((recording && recording->mode != mode) || (mode == RecordingMode::Owned && !recording))
+        return;
+    if (mode == RecordingMode::Observed && !HookList(list.Get()))
         return;
     ComPtr<ID3D12Device> suppliedDevice;
     if (FAILED(list->GetDevice(IID_PPV_ARGS(suppliedDevice.GetAddressOf()))))
@@ -579,11 +599,13 @@ ScopedFgGpuTime_Dx12::ScopedFgGpuTime_Dx12(ID3D12GraphicsCommandList* commandLis
     auto device = Canonical(suppliedDevice.Get());
     // The command-list interface does not expose its creation node mask.
     // Do not place a default-node timestamp heap on another linked GPU node.
-    if (device->GetNodeCount() != 1 || !ProbeQueue(device.Get(), list->GetType()) ||
+    const auto type = list->GetType();
+    if (device->GetNodeCount() != 1 ||
+        (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_COMPUTE) ||
+        (mode == RecordingMode::Observed && !ProbeQueue(device.Get(), type)) ||
         FAILED(device->GetDeviceRemovedReason()))
         return;
 
-    auto recording = GetData<RecordingData>(list.Get(), RecordingGuid);
     if (!recording)
     {
         recording.Attach(new RecordingData);
@@ -592,7 +614,6 @@ ScopedFgGpuTime_Dx12::ScopedFgGpuTime_Dx12(ID3D12GraphicsCommandList* commandLis
         // next successful Reset before writing any query into command storage.
         return;
     }
-
     FgGpuTime_Dx12::Poll();
     {
         std::lock_guard lock(GetPool().mutex);
@@ -617,7 +638,7 @@ ScopedFgGpuTime_Dx12::ScopedFgGpuTime_Dx12(ID3D12GraphicsCommandList* commandLis
         ++sample->allocatorPins;
         recording->allocator->samples.push_back(sample);
         recording->samples.push_back(sample);
-        if (!recording->counted)
+        if (mode == RecordingMode::Observed && !recording->counted)
         {
             recording->counted = true;
             ++liveRecordings;
@@ -704,17 +725,65 @@ bool FgGpuTime_Dx12::HookQueue(ID3D12CommandQueue* commandQueue)
     return GetTimeline(queue.Get()) != nullptr;
 }
 
+bool FgGpuTime_Dx12::BindOwnedRecording(ID3D12GraphicsCommandList* commandList, ID3D12CommandAllocator* allocator)
+{
+    auto list = Canonical(commandList);
+    auto realAllocator = Canonical(allocator);
+    if (!list || !realAllocator)
+        return false;
+
+    // Called only after the producer's successful allocator Reset. The observer may already have
+    // retired this generation when another backend installed the allocator hook; retirement is idempotent.
+    {
+        std::lock_guard lock(allocatorDataMutex);
+        if (auto data = GetData<AllocatorData>(realAllocator.Get(), AllocatorGuid))
+        {
+            RetireAllocator(data->generation);
+            realAllocator->SetPrivateDataInterface(AllocatorGuid, nullptr);
+        }
+    }
+    if (auto previous = GetData<RecordingData>(list.Get(), RecordingGuid))
+    {
+        std::lock_guard lock(GetPool().mutex);
+        previous->active = false;
+    }
+
+    ComPtr<RecordingData> recording;
+    recording.Attach(new RecordingData);
+    recording->mode = ScopedFgGpuTime_Dx12::RecordingMode::Owned;
+    recording->allocator = GetAllocatorGeneration(realAllocator.Get());
+    if (!recording->allocator)
+        return false;
+    return SUCCEEDED(list->SetPrivateDataInterface(RecordingGuid, recording.Get()));
+}
+
+void FgGpuTime_Dx12::SubmitOwnedRecording(ID3D12CommandQueue* commandQueue, ID3D12GraphicsCommandList* commandList)
+{
+    if (!commandQueue || !commandList)
+        return;
+    auto list = Canonical(commandList);
+    if (!list)
+        return;
+    // Preserve the producer's supplied queue/list and wrapper chain. Canonical objects are only
+    // used for timing metadata, not as replacements for the actual submission call.
+    ID3D12CommandList* submitted = commandList;
+    auto recording = GetData<RecordingData>(list.Get(), RecordingGuid);
+    if (!recording || recording->mode != ScopedFgGpuTime_Dx12::RecordingMode::Owned)
+    {
+        ExecuteNativeQueue(commandQueue, 1, &submitted);
+        return;
+    }
+    {
+        std::lock_guard lock(GetPool().mutex);
+        recording->closed = true;
+        recording->closeSucceeded = true; // The owner calls this only after a successful Close.
+    }
+    ExecuteRecordings(commandQueue, 1, &submitted, { recording }, ExecuteNativeQueue);
+}
+
 void FgGpuTime_Dx12::Poll()
 {
-    struct Result
-    {
-        std::shared_ptr<FgTiming::Channel> channel;
-        uint64_t epoch;
-        uint64_t frameId;
-        double milliseconds;
-        uint32_t generatedFrames;
-    };
-    std::vector<Result> results;
+    FgTiming::CompletedSamples results;
     auto& pool = GetPool();
     {
         std::lock_guard lock(pool.mutex);
@@ -764,8 +833,8 @@ void FgGpuTime_Dx12::Poll()
                         {
                             auto ms = (timestamps[1] - timestamps[0]) * 1000.0 / sample->frequency;
                             if (std::isfinite(ms))
-                                results.push_back({ std::move(channel), sample->epoch, sample->frameId, ms,
-                                                    sample->generatedFrames });
+                                results.Add(std::move(channel), sample->epoch, sample->frameId, ms,
+                                            sample->generatedFrames);
                         }
                         const D3D12_RANGE writeRange { 0, 0 };
                         sample->readback->Unmap(0, &writeRange);
@@ -783,10 +852,4 @@ void FgGpuTime_Dx12::Poll()
             }
         }
     }
-    // Pool slots retire independently, so their indices do not imply frame
-    // order. Preserve every completed sample accepted by Channel's dedup rule.
-    std::stable_sort(results.begin(), results.end(),
-                     [](const Result& a, const Result& b) { return a.frameId < b.frameId; });
-    for (auto& result : results)
-        result.channel->Publish(result.epoch, result.frameId, result.milliseconds, result.generatedFrames);
 }

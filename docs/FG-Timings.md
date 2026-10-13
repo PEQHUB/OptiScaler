@@ -10,7 +10,7 @@ measured scope, rolling average, completed-sample count and sample age. `Off` me
 | --- | --- |
 | OptiScaler FSR-FG, DX12 | The generation callback's GPU workload, including optical flow and interpolation. Preparation and presentation/UI work outside that dispatch are excluded. Applies to the FFX runtime selected by the user, including its FSR 4 FG route. |
 | OptiScaler FSR-FG, Vulkan | A generation GPU interval on an observed one-time command buffer with a known executing queue and completed SDK submission. The start/end pipeline stages can include preceding pending GPU work, including HUD preparation. Queues without timestamp support are unavailable. |
-| Reprojection, DX12 | Reprojection dispatch and its output copies. |
+| Reprojection, DX12 | Reprojection dispatch and its output copies. The producer binds its successful allocator/list reset and submits the closed recording through its known game queue; this route does not install timing API hooks or probe another queue's implementation. |
 | NGX to FFX, DX12 | One NGX evaluation's GPU work, including preparation and generation. The sample ID is an evaluation sequence, not a proven game/Present frame identity. |
 | Nukem FSR-FG, DX12 | One NGX evaluation, only when `DLSSG.IsRecording` confirms an already-recording command list. Paths which reset or close it internally are unavailable at this boundary. |
 | Combo, DX12 | Only the FSR-generated middle frame's evaluation. This is explicitly partial timing, not the full hybrid generation batch. |
@@ -43,6 +43,17 @@ enlistment. DX12 readback additionally requires allocator-generation retirement 
 prevent delayed results from repopulating reset history. Measurements older than one second expire.
 Unsafe/untracked or exhausted timing paths skip collection rather than reuse GPU resources early.
 
+DX12 submissions with recording metadata but no timestamp samples bypass timing fence allocation,
+submission locking and extra queue signals. Owned reprojection submissions preserve the caller's
+queue/list pointers and wrapper chain. The shared retirement pool retains query/readback resources
+through both submission completion and allocator retirement.
+
+Vulkan GPU-only timeline semaphores may move to another signaling queue after a nonblocking counter
+read proves the previous queue's last tracked signal has completed. Pending or unproven migrations,
+host signals and early-stage signals remain unavailable. DX12 and Vulkan publish completed readbacks
+in frame order within each collector batch, after releasing their metadata locks. Partial coverage is
+explicit sample metadata, independent of tooltip wording.
+
 The supported producer paths record new work for each dispatch. Arbitrary instrumentation chains which replay
 the same recording through unobserved queue implementations are unsupported for timing attribution; their
 execution queue and timestamp frequency cannot be inferred. Late hook installation and third-party hook chains
@@ -50,8 +61,10 @@ also require runtime stress validation.
 The API observers remain installed for process lifetime so in-progress game callbacks cannot lose
 their trampolines during FG teardown. Timing resources and device metadata retire independently.
 
-The standalone CPU tests cover invalid values, sample identity, epochs, history, freshness and Vulkan
-timestamp conversion. A successful DLL build establishes compilation, not game/runtime acceptance.
+The standalone CPU tests cover invalid values, sample identity, epochs, history, freshness, Vulkan
+timestamp conversion, drained/pending queue migration, untrusted signals, reverse-order readbacks,
+duplicate batches, context retirement and coverage metadata. A successful DLL build establishes
+compilation, not game/runtime acceptance.
 Before treating a route as runtime-qualified, compare the scopes against PIX/Nsight/Intel Inspector;
 exercise async on/off, MFG changes, repeated dispatch, FG pause/resume, resize/alt-tab and shutdown;
 and compare frame pacing with collection enabled and disabled.

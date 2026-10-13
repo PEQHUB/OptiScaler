@@ -216,7 +216,10 @@ ID3D12GraphicsCommandList* IFGFeature_Dx12::GetSCCommandList(int index)
             result = _scCommandList[index]->Reset(_scCommandAllocator[index], nullptr);
 
             if (result == S_OK)
+            {
                 _scCommandListResetted[index] = true;
+                OnSCCommandListReset(index);
+            }
             else
                 LOG_ERROR("_scCommandList[{}]->Reset() error: {:X}", index, (UINT) result);
         }

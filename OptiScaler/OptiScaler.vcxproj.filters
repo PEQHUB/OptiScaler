@@ -3,6 +3,7 @@
   <ItemGroup>
     <ClInclude Include="gpu_time\FgTiming.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="gpu_time\FgTimingHookThreads.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="gpu_time\FgTimingLifecycle.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="gpu_time\FgGpuTime_Dx12.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="gpu_time\FgGpuTime_Vk.h"><Filter>Header Files</Filter></ClInclude>
     <ClCompile Include="gpu_time\FgGpuTime_Dx12.cpp"><Filter>Source Files</Filter></ClCompile>

@@ -197,6 +197,7 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClInclude Include="gpu_time\GpuTime_Dx12.h" />
     <ClInclude Include="gpu_time\FgTiming.h" />
     <ClInclude Include="gpu_time\FgTimingHookThreads.h" />
+    <ClInclude Include="gpu_time\FgTimingLifecycle.h" />
     <ClInclude Include="gpu_time\FgGpuTime_Dx12.h" />
     <ClInclude Include="gpu_time\FgGpuTime_Vk.h" />
     <ClInclude Include="gpu_time\GpuTime_Vk.h" />

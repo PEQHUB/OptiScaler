@@ -285,7 +285,8 @@ NVSDK_NGX_Result Nvngx_FG::D3D12_CreateFeature(ID3D12GraphicsCommandList* InCmdL
                                                             : "NGX FG";
     const char* scope = type == FGNvngxReplacement::Combo ? "Combo FSR middle-frame GPU workload (partial)"
                                                           : "NGX evaluation GPU workload (preparation and generation)";
-    proxyHandle->gpuTiming = std::make_shared<FgTiming::Channel>(name, scope);
+    proxyHandle->gpuTiming = std::make_shared<FgTiming::Channel>(
+        name, scope, type == FGNvngxReplacement::Combo ? FgTiming::Coverage::Partial : FgTiming::Coverage::Full);
 
     std::scoped_lock lock(proxyHandle->handleMutex);
 

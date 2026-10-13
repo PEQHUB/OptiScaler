@@ -1,6 +1,7 @@
 #include "pch.h"
 #include "FgGpuTime_Vk.h"
 #include "FgTimingHookThreads.h"
+#include "FgTimingLifecycle.h"
 
 #include <hooks/Vulkan_Hooks.h>
 #include <detours/detours.h>
@@ -26,10 +27,8 @@ constexpr size_t MaxSignals = 16;
 struct SemaphoreState
 {
     uint64_t generation = 0;
-    uint64_t lastSignal = 0;
-    VkQueue queue = VK_NULL_HANDLE;
     bool timeline = false;
-    bool gpuOnly = true;
+    FgTiming::SignalTimeline<VkQueue> signals;
 };
 
 struct FenceState
@@ -177,7 +176,7 @@ bool Completed(DeviceState& device, const Sample& sample)
     {
         auto it = device.semaphores.find(sample.semaphore);
         if (it != device.semaphores.end() && it->second.generation == sample.semaphoreGeneration &&
-            it->second.timeline && it->second.gpuOnly && device.getCounter)
+            it->second.timeline && it->second.signals.Trusted() && device.getCounter)
         {
             uint64_t value = 0;
             if (device.getCounter(device.device, sample.semaphore, &value) == VK_SUCCESS &&
@@ -188,7 +187,7 @@ bool Completed(DeviceState& device, const Sample& sample)
     return false;
 }
 
-void PollBuffer(DeviceState& device, BufferState& buffer)
+void PollBuffer(DeviceState& device, BufferState& buffer, FgTiming::CompletedSamples& results)
 {
     if (!buffer.sample || !buffer.sample->submitted || buffer.sample->submissionPending || buffer.sample->completed)
         return;
@@ -211,7 +210,7 @@ void PollBuffer(DeviceState& device, BufferState& buffer)
     auto milliseconds = FgTiming::VulkanMilliseconds(
         timestamps[0], timestamps[1], device.families[sample.family].timestampValidBits, device.timestampPeriod);
     if (milliseconds)
-        sample.channel->Publish(sample.epoch, sample.frameId, *milliseconds, sample.generatedFrames);
+        results.Add(sample.channel, sample.epoch, sample.frameId, *milliseconds, sample.generatedFrames);
 }
 
 void DeleteQueries(DeviceState& device, BufferState& buffer)
@@ -260,9 +259,9 @@ VKAPI_ATTR void VKAPI_CALL HookDestroyDevice(VkDevice device, const VkAllocation
     destroyFunction(device, allocator);
 }
 
-void InvalidateRecording(DeviceState& device, BufferState& buffer)
+void InvalidateRecording(DeviceState& device, BufferState& buffer, FgTiming::CompletedSamples& results)
 {
-    PollBuffer(device, buffer);
+    PollBuffer(device, buffer, results);
     buffer.recording = false;
     buffer.oneTime = false;
     buffer.invalidated = true;
@@ -278,13 +277,13 @@ void InvalidateRecording(DeviceState& device, BufferState& buffer)
     }
 }
 
-void RetireBuffer(DeviceState& device, VkCommandBuffer commandBuffer)
+void RetireBuffer(DeviceState& device, VkCommandBuffer commandBuffer, FgTiming::CompletedSamples& results)
 {
     auto it = device.buffers.find(commandBuffer);
     if (it == device.buffers.end())
         return;
 
-    InvalidateRecording(device, it->second);
+    InvalidateRecording(device, it->second, results);
     if (it->second.sample && it->second.sample->submitted && !it->second.sample->completed)
         device.retired.push_back(std::move(it->second));
     else
@@ -292,14 +291,14 @@ void RetireBuffer(DeviceState& device, VkCommandBuffer commandBuffer)
     device.buffers.erase(it);
 }
 
-void PollDevice(DeviceState& device)
+void PollDevice(DeviceState& device, FgTiming::CompletedSamples& results)
 {
     for (auto& [handle, buffer] : device.buffers)
-        PollBuffer(device, buffer);
+        PollBuffer(device, buffer, results);
 
     for (auto it = device.retired.begin(); it != device.retired.end();)
     {
-        PollBuffer(device, *it);
+        PollBuffer(device, *it, results);
         if (!it->sample || it->sample->completed)
         {
             DeleteQueries(device, *it);
@@ -327,16 +326,16 @@ std::optional<Signal> ObserveSignals(DeviceState& device, VkQueue queue, const S
             continue;
 
         auto& semaphore = it->second;
-        if (!signals[i].allCommands || signals[i].value <= semaphore.lastSignal ||
-            (semaphore.queue != VK_NULL_HANDLE && semaphore.queue != queue))
+        std::optional<uint64_t> retired;
+        if (semaphore.signals.NeedsRetirement(queue) && device.getCounter)
         {
-            // An earlier-stage/other-queue/host signal must never satisfy the FG completion token.
-            semaphore.gpuOnly = false;
-            continue;
+            uint64_t value = 0;
+            if (device.getCounter(device.device, signals[i].semaphore, &value) == VK_SUCCESS)
+                retired = value;
         }
-        semaphore.queue = queue;
-        semaphore.lastSignal = signals[i].value;
-        if (semaphore.gpuOnly && !completion)
+        // A drained timeline can migrate queues without losing future timing. Pending cross-queue,
+        // early-stage and host signals still invalidate completion evidence; no GPU wait is added.
+        if (semaphore.signals.Observe(queue, signals[i].value, signals[i].allCommands, retired) && !completion)
             completion = signals[i];
     }
     return completion;
@@ -441,7 +440,7 @@ void InvalidateUnobservedSignal(VkSemaphore semaphore)
 {
     for (auto& [handle, device] : devices)
         if (auto it = device.semaphores.find(semaphore); it != device.semaphores.end())
-            it->second.gpuOnly = false;
+            it->second.signals.Invalidate();
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL HookCreateCommandPool(VkDevice device, const VkCommandPoolCreateInfo* info,
@@ -458,6 +457,7 @@ VKAPI_ATTR VkResult VKAPI_CALL HookCreateCommandPool(VkDevice device, const VkCo
 VKAPI_ATTR void VKAPI_CALL HookDestroyCommandPool(VkDevice device, VkCommandPool pool,
                                                   const VkAllocationCallbacks* allocator)
 {
+    FgTiming::CompletedSamples results;
     std::lock_guard lock(mutex);
     if (auto state = FindDevice(device))
     {
@@ -465,7 +465,7 @@ VKAPI_ATTR void VKAPI_CALL HookDestroyCommandPool(VkDevice device, VkCommandPool
         {
             auto current = it++;
             if (current->second.pool == pool)
-                RetireBuffer(*state, current->first);
+                RetireBuffer(*state, current->first, results);
         }
         state->pools.erase(pool);
     }
@@ -474,23 +474,25 @@ VKAPI_ATTR void VKAPI_CALL HookDestroyCommandPool(VkDevice device, VkCommandPool
 
 VKAPI_ATTR VkResult VKAPI_CALL HookResetCommandPool(VkDevice device, VkCommandPool pool, VkCommandPoolResetFlags flags)
 {
+    FgTiming::CompletedSamples results;
     std::lock_guard lock(mutex);
     if (auto state = FindDevice(device))
         for (auto& [handle, buffer] : state->buffers)
             if (buffer.pool == pool)
-                PollBuffer(*state, buffer);
+                PollBuffer(*state, buffer, results);
 
     auto result = originalResetCommandPool(device, pool, flags);
     if (auto state = FindDevice(device); result == VK_SUCCESS && state)
         for (auto& [handle, buffer] : state->buffers)
             if (buffer.pool == pool)
-                InvalidateRecording(*state, buffer);
+                InvalidateRecording(*state, buffer, results);
     return result;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL HookAllocateCommandBuffers(VkDevice device, const VkCommandBufferAllocateInfo* info,
                                                           VkCommandBuffer* commandBuffers)
 {
+    FgTiming::CompletedSamples results;
     std::lock_guard lock(mutex);
     auto result = originalAllocateCommandBuffers(device, info, commandBuffers);
     if (auto state = FindDevice(device); result == VK_SUCCESS && state && info && commandBuffers)
@@ -501,7 +503,7 @@ VKAPI_ATTR VkResult VKAPI_CALL HookAllocateCommandBuffers(VkDevice device, const
 
         for (uint32_t i = 0; i < info->commandBufferCount && state->buffers.size() < MaxBuffers; ++i)
         {
-            RetireBuffer(*state, commandBuffers[i]);
+            RetireBuffer(*state, commandBuffers[i], results);
             BufferState buffer;
             buffer.pool = info->commandPool;
             buffer.family = pool->second.family;
@@ -515,21 +517,23 @@ VKAPI_ATTR VkResult VKAPI_CALL HookAllocateCommandBuffers(VkDevice device, const
 VKAPI_ATTR void VKAPI_CALL HookFreeCommandBuffers(VkDevice device, VkCommandPool pool, uint32_t count,
                                                   const VkCommandBuffer* commandBuffers)
 {
+    FgTiming::CompletedSamples results;
     std::lock_guard lock(mutex);
     if (auto state = FindDevice(device); state && commandBuffers)
         for (uint32_t i = 0; i < count; ++i)
-            RetireBuffer(*state, commandBuffers[i]);
+            RetireBuffer(*state, commandBuffers[i], results);
     originalFreeCommandBuffers(device, pool, count, commandBuffers);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL HookBeginCommandBuffer(VkCommandBuffer commandBuffer,
                                                       const VkCommandBufferBeginInfo* info)
 {
+    FgTiming::CompletedSamples results;
     {
         std::lock_guard lock(mutex);
         BufferState* previous = nullptr;
         if (auto device = FindBuffer(commandBuffer, previous))
-            PollBuffer(*device, *previous);
+            PollBuffer(*device, *previous, results);
     }
     const auto result = originalBeginCommandBuffer(commandBuffer, info);
     std::lock_guard lock(mutex);
@@ -537,7 +541,7 @@ VKAPI_ATTR VkResult VKAPI_CALL HookBeginCommandBuffer(VkCommandBuffer commandBuf
     auto device = FindBuffer(commandBuffer, buffer);
     if (device && result == VK_SUCCESS && info)
     {
-        InvalidateRecording(*device, *buffer);
+        InvalidateRecording(*device, *buffer, results);
         buffer->recording = true;
         buffer->oneTime = (info->flags & VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT) != 0 &&
                           (info->flags & VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT) == 0;
@@ -561,14 +565,15 @@ VKAPI_ATTR VkResult VKAPI_CALL HookEndCommandBuffer(VkCommandBuffer commandBuffe
 
 VKAPI_ATTR VkResult VKAPI_CALL HookResetCommandBuffer(VkCommandBuffer commandBuffer, VkCommandBufferResetFlags flags)
 {
+    FgTiming::CompletedSamples results;
     std::lock_guard lock(mutex);
     BufferState* buffer = nullptr;
     auto device = FindBuffer(commandBuffer, buffer);
     if (device)
-        PollBuffer(*device, *buffer);
+        PollBuffer(*device, *buffer, results);
     auto result = originalResetCommandBuffer(commandBuffer, flags);
     if (device && result == VK_SUCCESS)
-        InvalidateRecording(*device, *buffer);
+        InvalidateRecording(*device, *buffer, results);
     return result;
 }
 
@@ -584,7 +589,7 @@ VKAPI_ATTR VkResult VKAPI_CALL HookCreateSemaphore(VkDevice device, const VkSema
         SemaphoreState value;
         value.generation = ++state->nextGeneration;
         value.timeline = type && type->semaphoreType == VK_SEMAPHORE_TYPE_TIMELINE;
-        value.lastSignal = type ? type->initialValue : 0;
+        value.signals = FgTiming::SignalTimeline<VkQueue>(type ? type->initialValue : 0);
         state->semaphores[*semaphore] = value;
     }
     return result;
@@ -593,10 +598,11 @@ VKAPI_ATTR VkResult VKAPI_CALL HookCreateSemaphore(VkDevice device, const VkSema
 VKAPI_ATTR void VKAPI_CALL HookDestroySemaphore(VkDevice device, VkSemaphore semaphore,
                                                 const VkAllocationCallbacks* allocator)
 {
+    FgTiming::CompletedSamples results;
     std::lock_guard lock(mutex);
     if (auto state = FindDevice(device))
     {
-        PollDevice(*state);
+        PollDevice(*state, results);
         state->semaphores.erase(semaphore);
     }
     originalDestroySemaphore(device, semaphore, allocator);
@@ -609,7 +615,7 @@ VkResult ObserveSignalSemaphore(PFN_vkSignalSemaphore signalFunction, VkDevice d
     // Invalidate before the host signal can make a pending GPU token appear ready.
     if (auto state = FindDevice(device); state && info)
         if (auto it = state->semaphores.find(info->semaphore); it != state->semaphores.end())
-            it->second.gpuOnly = false;
+            it->second.signals.Invalidate();
     return signalFunction(device, info);
 }
 
@@ -636,10 +642,11 @@ VKAPI_ATTR VkResult VKAPI_CALL HookCreateFence(VkDevice device, const VkFenceCre
 
 VKAPI_ATTR void VKAPI_CALL HookDestroyFence(VkDevice device, VkFence fence, const VkAllocationCallbacks* allocator)
 {
+    FgTiming::CompletedSamples results;
     std::lock_guard lock(mutex);
     if (auto state = FindDevice(device))
     {
-        PollDevice(*state);
+        PollDevice(*state, results);
         state->fences.erase(fence);
     }
     originalDestroyFence(device, fence, allocator);
@@ -647,10 +654,11 @@ VKAPI_ATTR void VKAPI_CALL HookDestroyFence(VkDevice device, VkFence fence, cons
 
 VKAPI_ATTR VkResult VKAPI_CALL HookResetFences(VkDevice device, uint32_t count, const VkFence* fences)
 {
+    FgTiming::CompletedSamples results;
     std::lock_guard lock(mutex);
     // Drain the old signaled generations before reset; a later signal belongs to a different submission.
     if (auto state = FindDevice(device))
-        PollDevice(*state);
+        PollDevice(*state, results);
     auto result = originalResetFences(device, count, fences);
     if (auto state = FindDevice(device); result == VK_SUCCESS && state && fences)
         for (uint32_t i = 0; i < count; ++i)
@@ -741,9 +749,8 @@ VkResult ObserveQueueSubmit2(PFN_vkQueueSubmit2 submitFunction, VkQueue queue, u
                         device && buffer->sample && !buffer->quarantined)
                         for (size_t k = 0; k < signalCount; ++k)
                             if (auto it = device->semaphores.find(signals[k].semaphore);
-                                it != device->semaphores.end() && it->second.timeline && it->second.gpuOnly &&
-                                it->second.queue == queue && signals[k].allCommands &&
-                                it->second.lastSignal == signals[k].value)
+                                it != device->semaphores.end() && it->second.timeline && signals[k].allCommands &&
+                                it->second.signals.Matches(queue, signals[k].value))
                             {
                                 auto& sample = *buffer->sample;
                                 sample.semaphore = signals[k].semaphore;
@@ -901,10 +908,11 @@ void FgGpuTime_Vk::RegisterQueue(VkDevice device, VkQueue queue, uint32_t family
 
 void FgGpuTime_Vk::Poll()
 {
+    FgTiming::CompletedSamples results;
     std::unique_lock lock(mutex, std::try_to_lock);
     if (lock.owns_lock())
         for (auto& [handle, device] : devices)
-            PollDevice(device);
+            PollDevice(device, results);
 }
 
 void FgGpuTime_Vk::ForgetDevice(VkDevice device)
