@@ -134,6 +134,14 @@ DeviceState* FindDevice(VkDevice device)
     return it == devices.end() ? nullptr : &it->second;
 }
 
+DeviceState* FindQueue(VkQueue queue)
+{
+    for (auto& [handle, device] : devices)
+        if (device.queues.contains(queue))
+            return &device;
+    return nullptr;
+}
+
 DeviceState* FindBuffer(VkCommandBuffer commandBuffer, BufferState*& buffer)
 {
     for (auto& [handle, device] : devices)
@@ -326,6 +334,11 @@ std::optional<Signal> ObserveSignals(DeviceState& device, VkQueue queue, const S
             continue;
 
         auto& semaphore = it->second;
+        if (!device.queues.contains(queue))
+        {
+            semaphore.signals.Invalidate();
+            continue;
+        }
         std::optional<uint64_t> retired;
         if (semaphore.signals.NeedsRetirement(queue) && device.getCounter)
         {
@@ -361,8 +374,13 @@ struct SubmissionRecords
 void ObserveSubmit(VkQueue queue, VkFence fence, const VkCommandBuffer* commandBuffers, size_t count,
                    const Signal* signals, size_t signalCount, bool supported, SubmissionRecords& pending)
 {
+    const auto executingDevice = FindQueue(queue);
     for (auto& [handle, device] : devices)
     {
+        // Nondispatchable semaphore/fence handles can have the same value on different devices.
+        // A known queue only updates its own device; an unknown queue cannot provide completion proof.
+        if (executingDevice && executingDevice != &device)
+            continue;
         auto completion = ObserveSignals(device, queue, signals, signalCount);
         auto queueIt = device.queues.find(queue);
         auto fenceIt = device.fences.find(fence);
@@ -385,6 +403,7 @@ void ObserveSubmit(VkQueue queue, VkFence fence, const VkCommandBuffer* commandB
             }
             sample.submitted = true;
             sample.submissionPending = true;
+            sample.family = UINT32_MAX;
             pending.Add(sample.serial);
             if (!supported || queueIt == device.queues.end() || queueIt->second != buffer.family || buffer.quarantined)
             {
@@ -436,10 +455,12 @@ void CompleteSubmit(const SubmissionRecords& pending, VkResult result)
     }
 }
 
-void InvalidateUnobservedSignal(VkSemaphore semaphore)
+void InvalidateUnobservedSignal(VkQueue queue, VkSemaphore semaphore)
 {
+    const auto executingDevice = FindQueue(queue);
     for (auto& [handle, device] : devices)
-        if (auto it = device.semaphores.find(semaphore); it != device.semaphores.end())
+        if (auto it = device.semaphores.find(semaphore);
+            (!executingDevice || executingDevice == &device) && it != device.semaphores.end())
             it->second.signals.Invalidate();
 }
 
@@ -691,7 +712,7 @@ VKAPI_ATTR VkResult VKAPI_CALL HookQueueSubmit(VkQueue queue, uint32_t count, co
 
                 // The bounded stack array must not hide a later signal of a semaphore used by an older sample.
                 for (size_t j = signalCount; j < submit.signalSemaphoreCount; ++j)
-                    InvalidateUnobservedSignal(submit.pSignalSemaphores[j]);
+                    InvalidateUnobservedSignal(queue, submit.pSignalSemaphores[j]);
 
                 const bool supported =
                     submit.signalSemaphoreCount <= MaxSignals &&
@@ -732,7 +753,7 @@ VkResult ObserveQueueSubmit2(PFN_vkQueueSubmit2 submitFunction, VkQueue queue, u
                     signals[j] = { signal.semaphore, signal.value, allCommands };
                 }
                 for (size_t j = signalCount; j < submit.signalSemaphoreInfoCount; ++j)
-                    InvalidateUnobservedSignal(submit.pSignalSemaphoreInfos[j].semaphore);
+                    InvalidateUnobservedSignal(queue, submit.pSignalSemaphoreInfos[j].semaphore);
                 const bool supported =
                     submit.signalSemaphoreInfoCount <= MaxSignals && (submit.flags & VK_SUBMIT_PROTECTED_BIT) == 0;
                 // Observe signals once per submit even when there are no command buffers, so another queue's
@@ -741,12 +762,13 @@ VkResult ObserveQueueSubmit2(PFN_vkQueueSubmit2 submitFunction, VkQueue queue, u
                 for (uint32_t j = 0; j < submit.commandBufferInfoCount; ++j)
                 {
                     auto commandBuffer = submit.pCommandBufferInfos[j].commandBuffer;
-                    ObserveSubmit(queue, fence, &commandBuffer, 1, nullptr, 0,
-                                  supported && submit.pCommandBufferInfos[j].deviceMask == 1, pending);
+                    const bool supportedBuffer = supported && submit.pCommandBufferInfos[j].deviceMask == 1;
+                    ObserveSubmit(queue, fence, &commandBuffer, 1, nullptr, 0, supportedBuffer, pending);
                     // The signal ledger is already updated, so attach the matching current token explicitly.
                     BufferState* buffer = nullptr;
-                    if (auto device = FindBuffer(commandBuffer, buffer);
-                        device && buffer->sample && !buffer->quarantined)
+                    if (auto device = FindBuffer(commandBuffer, buffer); supportedBuffer && device && buffer->sample &&
+                                                                         !buffer->quarantined &&
+                                                                         buffer->sample->family != UINT32_MAX)
                         for (size_t k = 0; k < signalCount; ++k)
                             if (auto it = device->semaphores.find(signals[k].semaphore);
                                 it != device->semaphores.end() && it->second.timeline && signals[k].allCommands &&

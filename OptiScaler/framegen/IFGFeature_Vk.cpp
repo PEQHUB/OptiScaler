@@ -64,6 +64,22 @@ void IFGFeature_Vk::ReserveQueues(VkPhysicalDevice physicalDevice, VkDeviceCreat
 {
     _physicalDevice = physicalDevice;
 
+    // Timestamp attribution needs one known physical device. A linked-device command buffer can
+    // execute its query writes on a different device mask from the submission's completion signal.
+    _singlePhysicalDevice = true;
+    auto next = static_cast<const VkBaseInStructure*>(createInfo.pNext);
+    for (size_t i = 0; next && i < 32; ++i, next = next->pNext)
+    {
+        if (next->sType == VK_STRUCTURE_TYPE_DEVICE_GROUP_DEVICE_CREATE_INFO)
+        {
+            auto group = reinterpret_cast<const VkDeviceGroupDeviceCreateInfo*>(next);
+            _singlePhysicalDevice = group->physicalDeviceCount == 1 && group->pPhysicalDevices &&
+                                    group->pPhysicalDevices[0] == physicalDevice;
+        }
+    }
+    if (next)
+        _singlePhysicalDevice = false;
+
     uint32_t familyCount = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &familyCount, nullptr);
     std::vector<VkQueueFamilyProperties> families(familyCount);

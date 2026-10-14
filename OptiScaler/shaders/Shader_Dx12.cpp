@@ -4,9 +4,11 @@
 
 using Microsoft::WRL::ComPtr;
 
-Shader_Dx12::Shader_Dx12(std::string InName, ID3D12Device* InDevice) : _name(InName), _device(InDevice)
+Shader_Dx12::Shader_Dx12(std::string InName, ID3D12Device* InDevice, bool collectGpuTime)
+    : _name(InName), _device(InDevice)
 {
-    GpuTime = std::make_unique<GpuTime_Dx12>(InDevice);
+    if (collectGpuTime)
+        GpuTime = std::make_unique<GpuTime_Dx12>(InDevice);
 }
 
 Shader_Dx12::~Shader_Dx12()

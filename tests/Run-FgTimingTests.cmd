@@ -14,4 +14,6 @@ if errorlevel 1 exit /b 1
 cl /nologo /std:c++20 /EHsc /W4 /WX /fp:precise tests\FgTimingLifecycleTests.cpp /Fo:tests\out\FgTimingLifecycleTests.obj /Fe:tests\out\FgTimingLifecycleTests.exe
 if errorlevel 1 exit /b 1
 tests\out\FgTimingLifecycleTests.exe
+if errorlevel 1 exit /b 1
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\Run-FgCollectorTests.ps1
 exit /b %errorlevel%

@@ -1,0 +1,571 @@
+#include "@@ROOT@@/OptiScaler/gpu_time/FgTiming.h"
+#include "@@ROOT@@/OptiScaler/gpu_time/FgTimingLifecycle.h"
+#include <array>
+#include <atomic>
+#include <functional>
+#include <iostream>
+#include <unordered_map>
+#include <vector>
+#include <cstdlib>
+static void Check(bool value, const char* message)
+{
+    if (!value)
+    {
+        std::cerr << message << '\n';
+        std::exit(1);
+    }
+}
+namespace VkProbe
+{
+using VkSemaphore = uint64_t;
+using VkQueue = uint64_t;
+using VkFence = uint64_t;
+using VkDevice = uint64_t;
+using VkCommandPool = uint64_t;
+using VkQueryPool = uint64_t;
+using VkCommandBuffer = uint64_t;
+constexpr uint64_t VK_NULL_HANDLE = 0;
+constexpr int VK_SUCCESS = 0;
+constexpr uint32_t VK_QUERY_RESULT_64_BIT = 1;
+struct Family
+{
+    uint32_t timestampValidBits = 64;
+};
+// @@VK_TYPES@@
+struct DeviceState
+{
+    VkDevice device = 1;
+    double timestampPeriod = 1000000.0;
+    size_t queryCount = 0;
+    std::vector<Family> families { Family {} };
+    std::unordered_map<VkQueue, uint32_t> queues;
+    std::unordered_map<VkSemaphore, SemaphoreState> semaphores;
+    std::unordered_map<VkFence, FenceState> fences;
+    std::unordered_map<VkCommandBuffer, BufferState> buffers;
+    std::vector<BufferState> retired;
+    std::function<int(VkDevice, VkFence)> getFenceStatus = [](VkDevice, VkFence) { return VK_SUCCESS; };
+    std::function<int(VkDevice, VkSemaphore, uint64_t*)> getCounter;
+    std::function<void(VkDevice, VkQueryPool, const void*)> destroyQueryPool;
+    std::function<int(VkDevice, VkQueryPool, uint32_t, uint32_t, size_t, void*, uint64_t, uint32_t)> getQueries;
+};
+std::unordered_map<VkDevice, DeviceState> devices;
+std::recursive_mutex mutex;
+constexpr size_t MaxDevices = 4, MaxQueryPools = 48, MaxSignals = 16;
+// @@VK_FIND_QUEUE@@
+// @@VK_FIND_BUFFER@@
+// @@VK_READBACK@@
+// @@VK_RETIREMENT@@
+// @@VK_SIGNALS@@
+using VkResult = int;
+constexpr int VK_ERROR_DEVICE_LOST = -4;
+constexpr uint64_t VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT = 2;
+constexpr uint32_t VK_SUBMIT_PROTECTED_BIT = 1;
+struct VkSemaphoreSubmitInfo
+{
+    VkSemaphore semaphore = 0;
+    uint64_t value = 0, stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    uint32_t deviceIndex = 0;
+};
+struct VkCommandBufferSubmitInfo
+{
+    VkCommandBuffer commandBuffer = 0;
+    uint32_t deviceMask = 1;
+};
+struct VkSubmitInfo2
+{
+    uint32_t flags = 0, signalSemaphoreInfoCount = 0;
+    const VkSemaphoreSubmitInfo* pSignalSemaphoreInfos = nullptr;
+    uint32_t commandBufferInfoCount = 0;
+    const VkCommandBufferSubmitInfo* pCommandBufferInfos = nullptr;
+};
+using PFN_vkQueueSubmit2 = VkResult (*)(VkQueue, uint32_t, const VkSubmitInfo2*, VkFence);
+// @@VK_PENDING@@
+// @@VK_UNOBSERVED@@
+// @@VK_SUBMIT2@@
+void RunReadback()
+{
+    DeviceState device;
+    device.queues[11] = 0;
+    device.queues[22] = 0;
+    uint64_t counter = 1;
+    int counterReads = 0, queryReads = 0, queryDeletes = 0;
+    device.getCounter = [&](VkDevice, VkSemaphore, uint64_t* out)
+    {
+        ++counterReads;
+        *out = counter;
+        return VK_SUCCESS;
+    };
+    device.destroyQueryPool = [&](VkDevice, VkQueryPool, const void*) { ++queryDeletes; };
+    device.getQueries = [&](VkDevice, VkQueryPool pool, uint32_t, uint32_t, size_t, void* data, uint64_t, uint32_t)
+    {
+        ++queryReads;
+        auto stamps = static_cast<uint64_t*>(data);
+        stamps[0] = 0;
+        stamps[1] = pool;
+        return VK_SUCCESS;
+    };
+    device.semaphores[1].timeline = true;
+    Signal first { 1, 1, true }, second { 1, 2, true }, third { 1, 3, true };
+    Check(ObserveSignals(device, 11, &first, 1).has_value(), "Vulkan initial token missing");
+    Check(ObserveSignals(device, 22, &second, 1).has_value(), "Vulkan drained migration did not recover");
+    Check(ObserveSignals(device, 22, &third, 1).has_value(), "Vulkan later token missing after migration");
+    Check(counterReads == 1, "Vulkan migration must use a single nonblocking counter query");
+    counter = 2;
+    Signal unsafe { 1, 4, true };
+    Check(!ObserveSignals(device, 11, &unsafe, 1), "Pending Vulkan migration falsely authorized completion");
+    Check(!device.semaphores[1].signals.Trusted(), "Unsafe Vulkan migration retained trusted tokens");
+
+    auto channel = std::make_shared<FgTiming::Channel>("vk", "interval");
+    device.fences[1].generation = 1;
+    device.buffers.emplace(101, BufferState {});
+    device.buffers.emplace(202, BufferState {});
+    device.queryCount = 2;
+    uint64_t frameId = 2;
+    for (auto& [handle, buffer] : device.buffers)
+    {
+        Sample sample;
+        sample.channel = channel;
+        sample.epoch = channel->Epoch();
+        sample.frameId = frameId;
+        sample.family = 0;
+        sample.fence = 1;
+        sample.fenceGeneration = 1;
+        sample.submitted = true;
+        sample.successful = true;
+        buffer.queries = frameId == 2 ? 20 : 10;
+        buffer.sample = sample;
+        --frameId;
+    }
+    {
+        FgTiming::CompletedSamples results;
+        PollDevice(device, results);
+    }
+    auto snapshot = channel->Read();
+    Check(snapshot.sampleCount == 2 && snapshot.averageMilliseconds == 15.0 && snapshot.milliseconds == 20.0,
+          "Vulkan reverse-order readbacks lost a valid sample");
+    {
+        FgTiming::CompletedSamples results;
+        PollDevice(device, results);
+    }
+    Check(queryReads == 2 && channel->Read().sampleCount == 2, "Vulkan completed samples were consumed twice");
+
+    BufferState pending;
+    pending.queries = 30;
+    Sample sample;
+    sample.channel = channel;
+    sample.epoch = channel->Epoch();
+    sample.frameId = 3;
+    sample.family = 0;
+    sample.fence = 1;
+    sample.fenceGeneration = 1;
+    sample.submitted = true;
+    sample.successful = true;
+    sample.submissionPending = true;
+    pending.sample = sample;
+    device.buffers.emplace(303, pending);
+    ++device.queryCount;
+    {
+        FgTiming::CompletedSamples results;
+        PollDevice(device, results);
+    }
+    Check(queryReads == 2, "Vulkan read queries before the submit callback returned");
+    device.buffers.at(303).sample->submissionPending = false;
+    {
+        FgTiming::CompletedSamples results;
+        PollDevice(device, results);
+    }
+    Check(channel->Read().sampleCount == 3 && channel->Read().milliseconds == 30.0,
+          "Vulkan successful submit did not unblock readback");
+
+    BufferState unknown;
+    unknown.queries = 40;
+    sample.frameId = 4;
+    sample.fence = 0;
+    sample.submissionPending = false;
+    unknown.sample = sample;
+    device.buffers.emplace(404, unknown);
+    ++device.queryCount;
+    {
+        FgTiming::CompletedSamples results;
+        RetireBuffer(device, 404, results);
+    }
+    Check(device.retired.size() == 1 && queryDeletes == 0,
+          "Vulkan destroyed query resources without completion evidence");
+    device.retired.front().sample->fence = 1;
+    {
+        FgTiming::CompletedSamples results;
+        PollDevice(device, results);
+    }
+    Check(device.retired.empty() && queryDeletes == 1 && channel->Read().sampleCount == 3,
+          "Vulkan cancelled recording did not retire safely without publishing");
+    std::cout << "Vulkan collector probes passed: migration, ordered readback, pending submit, cancellation and "
+                 "resource retirement\n";
+}
+int nativeSubmitCalls = 0;
+VkResult nativeSubmitResult = VK_SUCCESS;
+VkResult NativeSubmit2(VkQueue, uint32_t, const VkSubmitInfo2*, VkFence)
+{
+    ++nativeSubmitCalls;
+    // A ready fence/counter must not expose query results while the submit observer is pending.
+    FgTiming::CompletedSamples results;
+    for (auto& [handle, device] : devices)
+        PollDevice(device, results);
+    return nativeSubmitResult;
+}
+
+void RunSubmissionChecks()
+{
+    devices.clear();
+    auto& first = devices[1];
+    auto& second = devices[2];
+    first.queues[11] = 0;
+    second.queues[22] = 0;
+    first.semaphores[7].timeline = second.semaphores[7].timeline = true;
+    Signal signal { 7, 1, true };
+    SubmissionRecords pending;
+    ObserveSubmit(11, 0, nullptr, 0, &signal, 1, true, pending);
+    Check(first.semaphores[7].signals.Matches(11, 1), "Known Vulkan queue lost its signal");
+    Check(second.semaphores[7].signals.Trusted() && !second.semaphores[7].signals.Matches(11, 1),
+          "Aliased semaphore handles contaminated a different device");
+    ObserveSubmit(22, 0, nullptr, 0, &signal, 1, true, pending);
+    Check(second.semaphores[7].signals.Matches(22, 1), "The second device did not retain its own timeline");
+    InvalidateUnobservedSignal(11, 7);
+    Check(!first.semaphores[7].signals.Trusted() && second.semaphores[7].signals.Trusted(),
+          "Overflow signal observation invalidated the wrong device");
+
+    // Each case begins with a fresh command recording and GPU-only timeline.
+    // Unsupported masks, protection, queues and queue families must preserve submission but never
+    // bind a token that could permit early query-pool reuse on a different physical device.
+    for (int scenario = 0; scenario < 6; ++scenario)
+    {
+        devices.clear();
+        auto& device = devices[1];
+        device.queues[11] = scenario == 4 ? 1 : 0;
+        device.semaphores[5].timeline = true;
+        device.semaphores[5].generation = 1;
+        int reads = 0;
+        device.getCounter = [](VkDevice, VkSemaphore, uint64_t* value)
+        {
+            *value = 1;
+            return VK_SUCCESS;
+        };
+        device.getQueries = [&](VkDevice, VkQueryPool, uint32_t, uint32_t, size_t, void* data, uint64_t, uint32_t)
+        {
+            ++reads;
+            auto timestamps = static_cast<uint64_t*>(data);
+            timestamps[0] = 0;
+            timestamps[1] = 10;
+            return VK_SUCCESS;
+        };
+        auto channel = std::make_shared<FgTiming::Channel>("submit2", "interval");
+        BufferState buffer;
+        buffer.family = 0;
+        buffer.oneTime = true;
+        buffer.queries = 1;
+        Sample sample;
+        sample.channel = channel;
+        sample.epoch = channel->Epoch();
+        sample.frameId = 1;
+        sample.serial = 1;
+        sample.ended = sample.successful = true;
+        buffer.sample = sample;
+        device.buffers.emplace(101, buffer);
+        VkSemaphoreSubmitInfo semaphore;
+        semaphore.semaphore = 5;
+        semaphore.value = 1;
+        VkCommandBufferSubmitInfo commandBuffer;
+        commandBuffer.commandBuffer = 101;
+        commandBuffer.deviceMask = scenario == 1 ? 2 : 1;
+        VkSubmitInfo2 submit;
+        submit.flags = scenario == 2 ? VK_SUBMIT_PROTECTED_BIT : 0;
+        submit.signalSemaphoreInfoCount = submit.commandBufferInfoCount = 1;
+        submit.pSignalSemaphoreInfos = &semaphore;
+        submit.pCommandBufferInfos = &commandBuffer;
+        nativeSubmitCalls = 0;
+        nativeSubmitResult = scenario == 5 ? -7 : VK_SUCCESS;
+        const VkQueue queue = scenario == 3 ? 33 : 11;
+        Check(ObserveQueueSubmit2(NativeSubmit2, queue, 1, &submit, 0) == nativeSubmitResult,
+              "Vulkan observer changed the producer's submit result");
+        auto& observed = *device.buffers.at(101).sample;
+        Check(nativeSubmitCalls == 1 && reads == 0 && !observed.submissionPending,
+              "Vulkan observer duplicated submission or read before it returned");
+        if (scenario == 0)
+        {
+            Check(observed.semaphore == 5 && observed.family == 0,
+                  "Supported Vulkan submission lost completion evidence");
+            {
+                FgTiming::CompletedSamples results;
+                PollDevice(device, results);
+            }
+            Check(reads == 1 && channel->Read().milliseconds == 10.0, "Supported Vulkan readback was not published");
+        }
+        else
+        {
+            Check(observed.semaphore == 0 && observed.fence == 0 && !observed.successful,
+                  "Unsupported/failed Vulkan submission acquired unsafe completion evidence");
+            {
+                FgTiming::CompletedSamples results;
+                PollDevice(device, results);
+            }
+            Check(reads == 0 && !channel->Read().milliseconds, "Unsupported Vulkan submission exposed query results");
+        }
+    }
+    std::cout << "Vulkan submit2/device isolation probes passed\n";
+}
+
+void Run()
+{
+    RunReadback();
+    RunSubmissionChecks();
+}
+} // namespace VkProbe
+namespace DxProbe
+{
+#define STDMETHODCALLTYPE
+using UINT = unsigned int;
+using UINT64 = uint64_t;
+using HRESULT = int;
+inline bool SUCCEEDED(HRESULT value) { return value >= 0; }
+template <typename T> struct ComPtr
+{
+    T* pointer = nullptr;
+    ComPtr() = default;
+    ComPtr(T* value) : pointer(value) {}
+    T* Get() const { return pointer; }
+    T* operator->() const { return pointer; }
+    explicit operator bool() const { return pointer != nullptr; }
+};
+struct D3D12_RANGE
+{
+    size_t Begin, End;
+};
+struct ID3D12Device
+{
+    HRESULT removedReason = 0;
+    HRESULT GetDeviceRemovedReason() { return removedReason; }
+};
+struct ID3D12QueryHeap
+{
+};
+struct ID3D12Resource
+{
+    UINT64 stamps[2] { 10, 20 };
+    int maps = 0;
+    HRESULT Map(UINT, const D3D12_RANGE*, void** output)
+    {
+        ++maps;
+        *output = stamps;
+        return 0;
+    }
+    void Unmap(UINT, const D3D12_RANGE*) {}
+};
+struct ID3D12Fence
+{
+    UINT64 completed = 0;
+    UINT64 GetCompletedValue() { return completed; }
+};
+inline bool FAILED(HRESULT value) { return value < 0; }
+class ScopedFgGpuTime_Dx12
+{
+  public:
+    enum class RecordingMode
+    {
+        Observed,
+        Owned
+    };
+};
+constexpr size_t MaxSamples = 32, MaxCompletionQueues = 8;
+// @@DX_TYPES@@
+// @@DX_ALLOCATOR@@
+class PrivateData
+{
+  public:
+    virtual ~PrivateData() = default;
+};
+// @@DX_RECORDING@@
+struct ID3D12CommandList
+{
+    RecordingData* recording = nullptr;
+    ID3D12CommandList* real = nullptr;
+};
+struct ID3D12GraphicsCommandList : ID3D12CommandList
+{
+};
+struct ID3D12CommandQueue
+{
+    ID3D12CommandQueue* real = nullptr;
+    int executes = 0, bareExecutes = 0, signals = 0;
+    HRESULT signalResult = 0;
+    ID3D12CommandList* lastList = nullptr;
+    void ExecuteCommandLists(UINT count, ID3D12CommandList* const* lists);
+    HRESULT Signal(ID3D12Fence*, UINT64)
+    {
+        ++signals;
+        return real ? real->Signal(nullptr, 0) : signalResult;
+    }
+};
+using ExecuteFn = void (*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
+constexpr int RecordingGuid = 1;
+template <typename T> ComPtr<T> GetData(ID3D12CommandList* list, int)
+{
+    if (list->real)
+        list = list->real;
+    return ComPtr<T>(static_cast<T*>(list->recording));
+}
+ComPtr<ID3D12CommandQueue> Canonical(ID3D12CommandQueue* queue) { return queue->real ? queue->real : queue; }
+ComPtr<ID3D12GraphicsCommandList> Canonical(ID3D12GraphicsCommandList* list)
+{
+    return list->real ? static_cast<ID3D12GraphicsCommandList*>(list->real) : list;
+}
+int timelineLookups = 0;
+bool timelineAvailable = true;
+ID3D12CommandQueue* lastTimelineQueue = nullptr;
+std::shared_ptr<QueueTimeline> testTimeline;
+std::shared_ptr<QueueTimeline> GetTimeline(ID3D12CommandQueue* queue)
+{
+    ++timelineLookups;
+    lastTimelineQueue = queue;
+    return timelineAvailable ? testTimeline : nullptr;
+}
+void BareExecute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists)
+{
+    ++queue->bareExecutes;
+    queue->lastList = count ? lists[0] : nullptr;
+}
+ExecuteFn originalExecute = BareExecute;
+// @@DX_EXECUTE@@
+// @@DX_OWNER@@
+// @@DX_POLL@@
+void ID3D12CommandQueue::ExecuteCommandLists(UINT count, ID3D12CommandList* const* lists)
+{
+    ++executes;
+    if (real)
+        real->ExecuteCommandLists(count, lists);
+    else
+        ObserveExecute(this, count, lists);
+}
+void ResetFixture()
+{
+    liveRecordings = 1;
+    timelineLookups = 0;
+    timelineAvailable = true;
+    lastTimelineQueue = nullptr;
+    testTimeline = std::make_shared<QueueTimeline>();
+    static ID3D12Fence fence;
+    testTimeline->fence = &fence;
+    testTimeline->frequency = 1000;
+}
+std::shared_ptr<Sample> AddSample(RecordingData& recording)
+{
+    auto sample = std::make_shared<Sample>();
+    sample->recordingPins = 1;
+    sample->ended = true;
+    sample->publish = true;
+    sample->busy = true;
+    recording.samples.push_back(sample);
+    return sample;
+}
+void Run()
+{
+    ResetFixture();
+    {
+        RecordingData empty;
+        ID3D12GraphicsCommandList list;
+        list.recording = &empty;
+        ID3D12CommandQueue queue;
+        ID3D12CommandList* submitted = &list;
+        ObserveExecute(&queue, 1, &submitted);
+        Check(queue.bareExecutes == 1 && queue.signals == 0 && timelineLookups == 0,
+              "Untimed DX12 recording added timing fence work or changed execution count");
+    }
+    ResetFixture();
+    {
+        RecordingData owned;
+        owned.mode = ScopedFgGpuTime_Dx12::RecordingMode::Owned;
+        auto sample = AddSample(owned);
+        ID3D12GraphicsCommandList nativeList;
+        nativeList.recording = &owned;
+        ID3D12GraphicsCommandList suppliedList;
+        suppliedList.real = &nativeList;
+        ID3D12CommandQueue nativeQueue, suppliedQueue;
+        suppliedQueue.real = &nativeQueue;
+        SubmitOwnedRecording(&suppliedQueue, &suppliedList);
+        Check(sample->executions == 1 && sample->submitting == 0 && sample->completions.size() == 1,
+              "Owned DX12 submission was missed or double counted by installed observers");
+        Check(suppliedQueue.executes == 1 && nativeQueue.bareExecutes == 1 && nativeQueue.lastList == &suppliedList &&
+                  lastTimelineQueue == &nativeQueue,
+              "Owned DX12 submission bypassed the supplied wrapper chain");
+        Check(suppliedQueue.signals == 1 && testTimeline->nextValue == 1 && sample->frequency == 1000,
+              "Owned DX12 submission emitted the wrong completion proof");
+        SubmitOwnedRecording(&suppliedQueue, &suppliedList);
+        Check(sample->executions == 2 && !sample->publish && sample->completions.front().value == 2,
+              "DX12 replay did not invalidate publication and retain its latest completion");
+    }
+    ResetFixture();
+    {
+        RecordingData recording;
+        recording.closeSucceeded = true;
+        auto sample = AddSample(recording);
+        ID3D12GraphicsCommandList list;
+        list.recording = &recording;
+        ID3D12CommandQueue queue;
+        queue.signalResult = -1;
+        ID3D12CommandList* submitted = &list;
+        ObserveExecute(&queue, 1, &submitted);
+        Check(queue.bareExecutes == 1 && sample->submitting == 0 && sample->quarantined && !sample->publish,
+              "Failed DX12 signal changed rendering or permitted unsafe readback");
+    }
+    ResetFixture();
+    timelineAvailable = false;
+    {
+        RecordingData recording;
+        recording.closeSucceeded = true;
+        auto sample = AddSample(recording);
+        ID3D12GraphicsCommandList list;
+        list.recording = &recording;
+        ID3D12CommandQueue queue;
+        ID3D12CommandList* submitted = &list;
+        ObserveExecute(&queue, 1, &submitted);
+        Check(queue.bareExecutes == 1 && queue.signals == 0 && sample->quarantined,
+              "Missing DX12 timeline must preserve rendering and quarantine the sample");
+    }
+    ResetFixture();
+    {
+        ID3D12Device device;
+        ID3D12Resource readback;
+        auto channel = std::make_shared<FgTiming::Channel>("dx12", "interval");
+        auto sample = std::make_shared<Sample>();
+        sample->device = &device;
+        sample->readback = &readback;
+        sample->channel = channel;
+        sample->epoch = channel->Epoch();
+        sample->frameId = 1;
+        sample->busy = sample->ended = sample->publish = true;
+        sample->executions = 1;
+        sample->frequency = 1000;
+        sample->recordingPins = sample->allocatorPins = 1;
+        testTimeline->fence.Get()->completed = 1;
+        sample->completions.push_back({ testTimeline, 1 });
+        GetPool().samples[0] = sample;
+        Poll();
+        Check(readback.maps == 0 && !channel->Read().milliseconds,
+              "DX12 readback preceded allocator retirement despite a ready fence");
+        sample->allocatorPins = 0;
+        Poll();
+        Check(readback.maps == 1 && channel->Read().milliseconds == 10.0,
+              "DX12 allocator retirement did not release completed readback");
+        sample->allocatorPins = 1;
+        device.removedReason = -1;
+        Poll();
+        Check(!GetPool().samples[0] && sample->recordingPins == 1 && sample->allocatorPins == 1,
+              "Retained objects from a removed device exhausted the timing pool or lost their sample");
+    }
+    std::cout << "DX12 collector probes passed: untimed bypass, owned submission, wrapper preservation, replay, "
+                 "failure and device retirement\n";
+}
+} // namespace DxProbe
+int main()
+{
+    VkProbe::Run();
+    DxProbe::Run();
+}

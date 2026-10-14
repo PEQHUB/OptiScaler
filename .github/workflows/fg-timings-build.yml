@@ -1,10 +1,8 @@
-name: FG Timing DLL
+name: Fork Build
 
 on:
   push:
-    branches: [feature/fg-gpu-timings]
-  pull_request:
-    branches: [master]
+    branches: [main]
   workflow_dispatch:
 
 permissions:

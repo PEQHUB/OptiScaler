@@ -204,12 +204,14 @@ bool FSRFG_Vk::CreateSwapchain(VkDevice device, const VkSwapchainCreateInfoKHR* 
     desc.presentQueue = queueInfo(presentQueue);
     desc.imageAcquireQueue = queueInfo(acquireQueue);
 
-    FgGpuTime_Vk::Hook(device, _physicalDevice);
-    FgGpuTime_Vk::RegisterQueue(device, _gameQueue, _gameQueueFamily);
-    for (const auto& queue : _extraQueues)
+    if (_singlePhysicalDevice && FgGpuTime_Vk::Hook(device, _physicalDevice))
     {
-        if (queue.queue != VK_NULL_HANDLE)
-            FgGpuTime_Vk::RegisterQueue(device, queue.queue, queue.family);
+        FgGpuTime_Vk::RegisterQueue(device, _gameQueue, _gameQueueFamily);
+        for (const auto& queue : _extraQueues)
+        {
+            if (queue.queue != VK_NULL_HANDLE)
+                FgGpuTime_Vk::RegisterQueue(device, queue.queue, queue.family);
+        }
     }
 
     auto result = FfxApiProxy::VULKAN_CreateContext()(&_swapChainContext, &desc.header, nullptr);

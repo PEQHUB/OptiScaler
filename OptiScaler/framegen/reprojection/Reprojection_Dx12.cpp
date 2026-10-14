@@ -221,16 +221,7 @@ void Reprojection_Dx12::EvaluateState(ID3D12Device* device, FG_Constants& fgCons
     }
 }
 
-std::optional<double> Reprojection_Dx12::ReadGpuTime(void* commandQueue)
-{
-    // In the future we might not be able to use this provided commandQueue
-    if (_reproject && _reproject->IsInit() && commandQueue)
-    {
-        return _reproject->ReadGpuTime((ID3D12CommandQueue*) commandQueue);
-    }
-
-    return std::nullopt;
-}
+std::optional<double> Reprojection_Dx12::ReadGpuTime(void*) { return _gpuTiming->Read().milliseconds; }
 
 bool Reprojection_Dx12::Present()
 {
@@ -280,7 +271,7 @@ bool Reprojection_Dx12::Present()
         {
             if (_reproject.get() == nullptr)
             {
-                _reproject = std::make_unique<Reproject_Dx12>("Reproject", _device);
+                _reproject = std::make_unique<Reproject_Dx12>("Reproject", _device, false);
             }
             else if (_reproject->IsInit())
             {

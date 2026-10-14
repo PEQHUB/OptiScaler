@@ -47,12 +47,20 @@ DX12 submissions with recording metadata but no timestamp samples bypass timing 
 submission locking and extra queue signals. Owned reprojection submissions preserve the caller's
 queue/list pointers and wrapper chain. The shared retirement pool retains query/readback resources
 through both submission completion and allocator retirement.
+Removed-device samples leave the shared pool so retained old command objects cannot exhaust timing
+slots for a new device; those old objects retain their own resource references until retirement.
+Reprojection's footer and detailed timing use this same completed channel; its legacy per-shader
+timer is disabled to avoid duplicate GPU queries and conflicting measurements.
 
 Vulkan GPU-only timeline semaphores may move to another signaling queue after a nonblocking counter
 read proves the previous queue's last tracked signal has completed. Pending or unproven migrations,
 host signals and early-stage signals remain unavailable. DX12 and Vulkan publish completed readbacks
 in frame order within each collector batch, after releasing their metadata locks. Partial coverage is
 explicit sample metadata, independent of tooltip wording.
+Queue observations are scoped to their registered device. Unsupported submit/device masks cannot
+acquire a completion token or allow early query-pool reuse.
+Vulkan collection also requires device-creation evidence for one physical device; linked-device
+groups leave timing unavailable while preserving the existing FG path.
 
 The supported producer paths record new work for each dispatch. Arbitrary instrumentation chains which replay
 the same recording through unobserved queue implementations are unsupported for timing attribution; their
@@ -65,6 +73,10 @@ The standalone CPU tests cover invalid values, sample identity, epochs, history,
 timestamp conversion, drained/pending queue migration, untrusted signals, reverse-order readbacks,
 duplicate batches, context retirement and coverage metadata. A successful DLL build establishes
 compilation, not game/runtime acceptance.
+The collector test target compiles selected production observer/readback functions against CPU
+queue/query fixtures. It checks submission preservation, replay/failure handling, pending-submit
+readback, query retirement, cross-device handle isolation and unsupported submit masks. These
+fixtures do not load a graphics runtime or qualify driver/game behavior.
 Before treating a route as runtime-qualified, compare the scopes against PIX/Nsight/Intel Inspector;
 exercise async on/off, MFG changes, repeated dispatch, FG pause/resume, resize/alt-tab and shutdown;
 and compare frame pacing with collection enabled and disabled.

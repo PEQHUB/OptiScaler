@@ -52,6 +52,7 @@ class IFGFeature_Vk : public virtual IFGFeature
     std::vector<ExtraQueue> _extraQueues;
 
     VkPhysicalDevice _physicalDevice = VK_NULL_HANDLE;
+    bool _singlePhysicalDevice = false;
     VkDevice _device = VK_NULL_HANDLE;
     VkQueue _gameQueue = VK_NULL_HANDLE;
     uint32_t _gameQueueFamily = UINT32_MAX;

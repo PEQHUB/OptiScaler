@@ -177,7 +177,7 @@ class Reproject_Dx12 : public Shader_Dx12
     // Expected to be in D3D12_RESOURCE_STATE_COPY_SOURCE
     ID3D12Resource* GetCurrentBuffer();
 
-    Reproject_Dx12(std::string InName, ID3D12Device* InDevice);
+    Reproject_Dx12(std::string InName, ID3D12Device* InDevice, bool collectGpuTime = true);
 
     ~Reproject_Dx12();
 };

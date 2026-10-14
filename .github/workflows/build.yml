@@ -29,6 +29,7 @@ permissions:
 
 jobs:
   build:
+    if: github.repository == 'optiscaler/OptiScaler'
     runs-on: windows-latest
 
     steps:

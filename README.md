@@ -1,3 +1,15 @@
+## PEQHUB development fork
+
+This fork keeps current OptiScaler functionality and adds completed frame-generation GPU timings
+to the menu footer. Timing coverage, measured scopes and validation limits are documented in
+[FG-Timings.md](docs/FG-Timings.md). Development DLL packages are available from the
+[Fork Build workflow](https://github.com/PEQHUB/OptiScaler/actions/workflows/fg-timings-build.yml).
+GPU/game qualification is still pending; build artifacts include their source commit and DLL hash.
+
+The earlier v0.9.2 VibeFlex2 resource-warp work remains on
+[codex/update-v0.9.2-port](https://github.com/PEQHUB/OptiScaler/tree/codex/update-v0.9.2-port).
+The documentation and release links below describe upstream OptiScaler.
+
 <div align="center">
 
   ![Logo](https://github.com/user-attachments/assets/c7dad5da-0b29-4710-8a57-b58e4e407abd)

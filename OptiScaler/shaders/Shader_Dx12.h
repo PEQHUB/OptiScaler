@@ -59,9 +59,12 @@ class Shader_Dx12
   public:
     bool IsInit() const { return _init; }
     std::string Name() const { return _name; }
-    std::optional<double> ReadGpuTime(ID3D12CommandQueue* commandQueue) { return GpuTime->ReadGpuTime(commandQueue); }
+    std::optional<double> ReadGpuTime(ID3D12CommandQueue* commandQueue)
+    {
+        return GpuTime ? GpuTime->ReadGpuTime(commandQueue) : std::nullopt;
+    }
 
-    Shader_Dx12(std::string InName, ID3D12Device* InDevice);
+    Shader_Dx12(std::string InName, ID3D12Device* InDevice, bool collectGpuTime = true);
 
     ~Shader_Dx12();
 };

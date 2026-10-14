@@ -251,7 +251,8 @@ bool Reproject_Dx12::CreateMaskResource(ID3D12Resource** resource, uint32_t widt
     return true;
 }
 
-Reproject_Dx12::Reproject_Dx12(std::string InName, ID3D12Device* InDevice) : Shader_Dx12(InName, InDevice)
+Reproject_Dx12::Reproject_Dx12(std::string InName, ID3D12Device* InDevice, bool collectGpuTime)
+    : Shader_Dx12(InName, InDevice, collectGpuTime)
 {
     if (InDevice == nullptr)
     {

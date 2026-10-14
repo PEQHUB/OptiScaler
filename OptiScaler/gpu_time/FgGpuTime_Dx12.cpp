@@ -784,6 +784,8 @@ void FgGpuTime_Dx12::SubmitOwnedRecording(ID3D12CommandQueue* commandQueue, ID3D
 void FgGpuTime_Dx12::Poll()
 {
     FgTiming::CompletedSamples results;
+    std::array<std::pair<ID3D12Device*, bool>, MaxSamples> deviceStatus {};
+    size_t deviceCount = 0;
     auto& pool = GetPool();
     {
         std::lock_guard lock(pool.mutex);
@@ -793,6 +795,18 @@ void FgGpuTime_Dx12::Poll()
                 continue;
             bool complete = true;
             bool removed = false;
+            if (sample->quarantined || sample->completions.empty())
+            {
+                size_t index = 0;
+                while (index < deviceCount && deviceStatus[index].first != sample->device.Get())
+                    ++index;
+                if (index == deviceCount)
+                {
+                    deviceStatus[deviceCount++] = { sample->device.Get(),
+                                                    FAILED(sample->device->GetDeviceRemovedReason()) };
+                }
+                removed = deviceStatus[index].second;
+            }
             for (auto& item : sample->completions)
             {
                 auto value = item.queue->fence->GetCompletedValue();
@@ -803,7 +817,6 @@ void FgGpuTime_Dx12::Poll()
             }
             if (sample->quarantined)
             {
-                removed = removed || FAILED(sample->device->GetDeviceRemovedReason());
                 // Allocator retirement independently covers every GPU use,
                 // even when a queue Signal failed or its implementation was
                 // unobserved. Known fence values must also retire below.
@@ -812,6 +825,14 @@ void FgGpuTime_Dx12::Poll()
             }
             if (!complete && !removed)
                 continue;
+            if (removed)
+            {
+                // Removed devices cannot execute again. Drop the pool's reference so retained old
+                // command objects cannot exhaust timing slots on a newly created device. Their
+                // recording/allocator metadata still owns the old sample until normal retirement.
+                sample.reset();
+                continue;
+            }
 
             // An observed submission fence alone does not prevent a later,
             // unobserved replay from writing the same readback. Allocator
