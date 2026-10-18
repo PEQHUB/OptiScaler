@@ -918,9 +918,20 @@ bool InputCommon::get_render_costs(double& gpuRenderMs, double& cpuFrameMs)
         return std::max(sim, submit);
     };
 
+    // Which source answered, logged now and then so a missing one can be told apart from a slow game
+    static auto lastSourceLog = std::chrono::steady_clock::time_point {};
+    const bool logSource = std::chrono::steady_clock::now() - lastSourceLog > std::chrono::seconds(30);
+    if (logSource)
+        lastSourceLog = std::chrono::steady_clock::now();
+
     if (activeOutput == LowLatencyMode::Reflex && output_api == API::Vulkan)
     {
-        if (auto reflexVk = std::dynamic_pointer_cast<ReflexVk>(currently_active_tech.load()))
+        auto reflexVk = std::dynamic_pointer_cast<ReflexVk>(currently_active_tech.load());
+
+        if (logSource && !reflexVk)
+            LOG_INFO("Render costs: the Vulkan Reflex output isn't a ReflexVk");
+
+        if (reflexVk)
         {
             std::array<VkLatencyTimingsFrameReportNV, NVAPI_BUFFER_SIZE> timings {};
             for (auto& timing : timings)
@@ -931,7 +942,18 @@ bool InputCommon::get_render_costs(double& gpuRenderMs, double& cpuFrameMs)
             info.timingCount = (uint32_t) timings.size();
             info.pTimings = timings.data();
 
-            if (reflexVk->get_latency(&info) == VK_SUCCESS)
+            const auto latencyResult = reflexVk->get_latency(&info);
+
+            if (logSource)
+            {
+                LOG_INFO("Render costs: vkGetLatencyTimingsNV {}, {} timings, newest present id {}",
+                         latencyResult == VK_SUCCESS ? "ok" : "unavailable", info.timingCount,
+                         info.timingCount > 0
+                             ? timings[std::min<uint32_t>(info.timingCount, NVAPI_BUFFER_SIZE) - 1].presentID
+                             : 0);
+            }
+
+            if (latencyResult == VK_SUCCESS)
             {
                 const uint32_t count = std::min<uint32_t>(info.timingCount, (uint32_t) timings.size());
 
@@ -978,7 +1000,13 @@ bool InputCommon::get_render_costs(double& gpuRenderMs, double& cpuFrameMs)
     FrameReport reports[NVAPI_BUFFER_SIZE] {};
 
     if (!copy_frame_reports(reports))
+    {
+        if (logSource)
+            LOG_INFO("Render costs: no marker reports either (output {}, input {})",
+                     magic_enum::enum_name(activeOutput), magic_enum::enum_name(activeInput));
+
         return false;
+    }
 
     uint64_t cpuSumUs = 0;
     size_t cpuFrames = 0;

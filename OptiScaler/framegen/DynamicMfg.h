@@ -77,8 +77,26 @@ class DynamicMfgController
         _upSinceMs = -1.0;
         _downSinceMs = -1.0;
         _settleUntilMs = -1.0;
+        _firstFrameMs = -1.0;
         _frames = 0;
         _backoff = 1.0;
+    }
+
+    // After a pause (menus, loading, frame generation off for a while): measure and warm up again, but keep the
+    // multiplier, the learned cost factor and the back-off
+    void ResetMeasurements()
+    {
+        _status.baseFps = 0.0;
+        _status.capacityFps = 0.0;
+        _status.gpuRenderMs = 0.0;
+        _status.cpuFrameMs = 0.0;
+        _lastFrameMs = -1.0;
+        _baseIntervalMs = 0.0;
+        _upSinceMs = -1.0;
+        _downSinceMs = -1.0;
+        _settleUntilMs = -1.0;
+        _firstFrameMs = -1.0;
+        _frames = 0;
     }
 
     const Status& GetStatus() const { return _status; }
@@ -100,7 +118,9 @@ class DynamicMfgController
         // Runs during warmup too, so the cost factor is learned before the first decision
         UpdateCapacity(sample, settings);
 
-        if (_frames < kWarmupFrames)
+        // Right after a start or a pause the first frames are often slow: they're discarded (kWarmupMs), then the
+        // rates need kMeasureMs of clean frames before deciding anything
+        if (_frames < kWarmupFrames || now - _firstFrameMs < kWarmupMs + kMeasureMs)
             return current;
 
         // The smallest multiplier that reaches the target, with slack so that 2.0001x doesn't become 3x
@@ -147,6 +167,8 @@ class DynamicMfgController
 
   private:
     static constexpr int kWarmupFrames = 8;
+    static constexpr double kWarmupMs = 500.0;  // Frames discarded after a start or pause
+    static constexpr double kMeasureMs = 300.0; // Then measured before the first decision
     static constexpr double kRoundingSlack = 0.02;
     static constexpr double kBindingTolerance = 0.95; // Base within 5 % of target / multiplier = held by the cap
     static constexpr double kRevertWindowMs = 5000.0;
@@ -160,6 +182,7 @@ class DynamicMfgController
     double _upSinceMs = -1.0;
     double _downSinceMs = -1.0;
     double _settleUntilMs = -1.0;
+    double _firstFrameMs = -1.0;
     uint32_t _frames = 0;
     double _backoff = 1.0;
 
@@ -209,17 +232,21 @@ class DynamicMfgController
     {
         double dt = 0.0;
 
+        if (_frames++ == 0)
+            _firstFrameMs = sample.nowMs;
+
         if (_lastFrameMs >= 0.0)
-        {
             dt = sample.nowMs - _lastFrameMs;
 
-            // A long gap is a pause (menu, loading), not a frame
-            if (dt > 0.0 && dt < 250.0)
-                _baseIntervalMs = Smooth(_baseIntervalMs, dt, dt, settings.emaTimeMs);
-        }
-
         _lastFrameMs = sample.nowMs;
-        _frames++;
+
+        // Warmup frames don't count
+        if (sample.nowMs - _firstFrameMs < kWarmupMs)
+            return;
+
+        // A long gap is a pause (menu, loading), not a frame
+        if (dt > 0.0 && dt < 250.0)
+            _baseIntervalMs = Smooth(_baseIntervalMs, dt, dt, settings.emaTimeMs);
 
         if (sample.gpuRenderMs > 0.0)
             _status.gpuRenderMs = Smooth(_status.gpuRenderMs, sample.gpuRenderMs, dt, settings.emaTimeMs);

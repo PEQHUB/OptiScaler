@@ -14,6 +14,7 @@ class DLSSG_Common : public virtual IFGFeature
     bool _dynamicMfgRunning = false;
     double _dynamicMfgLastFrameMs = -1.0;
     double _dynamicMfgLastLogMs = 0.0;
+    uint32_t _dynamicMfgFramesNotGenerating = 0;
     bool _dynamicMfgOwnsCap = false;
     float _dynamicMfgCap = 0.0f;               // The FPS limit it set
     std::optional<float> _capBeforeDynamicMfg; // The FPS limit to restore

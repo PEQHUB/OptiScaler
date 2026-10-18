@@ -143,6 +143,8 @@ class InputCommon
     // Recent GPU render and CPU frame times in ms for OptiScaler's Dynamic MFG, 0 when unknown. The GPU time needs
     // the Vulkan Reflex output's latency timings, OptiScaler's own marker reports only carry CPU times.
     static bool get_render_costs(double& gpuRenderMs, double& cpuFrameMs);
+    // OptiScaler's FPS limit as the interval between the game's frames (frame generation included), 0 = none
+    static uint32_t get_fps_limit_interval_us() { return fps_limit_interval_us; }
     static uint64_t get_last_present_start_frame_id() { return last_present_start_frame_id; };
     static flag_set<LowLatencyInput> get_avaliable_inputs() { return avaliableInputs; };
     static LowLatencyMode active_output() { return activeOutput; }

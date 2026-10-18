@@ -124,6 +124,8 @@ void DLSSG_Common::SetOptions(bool gameMarkersReachStreamline)
     sl::ReflexOptions reflexConst = {};
     reflexConst.mode = sl::ReflexMode::eLowLatency;
     reflexConst.useMarkersToOptimize = gameMarkersReachStreamline && ReflexHooks::gameIsSendingMarkers();
+    // Streamline applies frameLimitUs on every call, 0 would lift OptiScaler's FPS limit each frame
+    reflexConst.frameLimitUs = InputCommon::get_fps_limit_interval_us();
 
     ScopedOptiScalerReflex optiScalerCall {};
     auto reflexSetOptionsResult = StreamlineProxy::ReflexSetOptions()(reflexConst);
@@ -169,17 +171,39 @@ int DLSSG_Common::UpdateOptiDynamicMfg(int fixedCount)
     const double nowMs =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
 
-    // A pause (menus, loading) leaves stale timings behind
-    if (!_dynamicMfgRunning || (_dynamicMfgLastFrameMs >= 0.0 && nowMs - _dynamicMfgLastFrameMs > 500.0))
+    if (!_dynamicMfgRunning)
     {
-        if (!_dynamicMfgRunning)
-            LOG_INFO("Dynamic MFG (OptiScaler) started, up to {}x", _maxInterpolationCount + 1);
-
+        LOG_INFO("Dynamic MFG (OptiScaler) started, up to {}x", _maxInterpolationCount + 1);
         _dynamicMfg.Reset();
         _dynamicMfgRunning = true;
     }
+    else if (_dynamicMfgLastFrameMs >= 0.0 && nowMs - _dynamicMfgLastFrameMs > 500.0)
+    {
+        // A pause (menus, loading) leaves stale timings behind
+        _dynamicMfg.ResetMeasurements();
+    }
 
     _dynamicMfgLastFrameMs = nowMs;
+    const int currentMultiplier = _dynamicMfg.GetStatus().multiplier;
+    const int heldCount = currentMultiplier > 0 ? currentMultiplier - 1 : fixedCount;
+
+    // Only frames DLSS-G actually multiplied describe what it costs. While it's off (menus, loading, toggles) the
+    // real frame rate carries no generation work and the FPS limit isn't divided by the multiplier.
+    sl::DLSSGState slState {};
+    if (StreamlineProxy::DLSSGGetState() != nullptr &&
+        StreamlineProxy::DLSSGGetState()(_viewport, slState, nullptr) == sl::Result::eOk &&
+        slState.numFramesActuallyPresented <= 1)
+    {
+        if (++_dynamicMfgFramesNotGenerating == 3)
+        {
+            LOG_INFO("Dynamic MFG: DLSS-G isn't generating, holding {}x", heldCount + 1);
+            _dynamicMfg.ResetMeasurements();
+        }
+
+        return heldCount;
+    }
+
+    _dynamicMfgFramesNotGenerating = 0;
 
     bool autoTarget = false;
     const float target = DynamicMfgTarget(nowMs, autoTarget);
