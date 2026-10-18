@@ -428,6 +428,9 @@
     <ClInclude Include="framegen\IFGFeature_Vk.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="framegen\DynamicMfg.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="hudfix\Hudfix_Dx11.h">
       <Filter>Header Files</Filter>
     </ClInclude>

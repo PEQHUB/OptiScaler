@@ -648,6 +648,10 @@ class Config
     CustomOptional<bool> FGDLSSGOverrideForceDMFG { false };   // Overrides game's DLSSG mode to Dynamic
     CustomOptional<bool> FGDLSSGForceDMFG { false };           // Overrides Opti's DLSSG mode to Dynamic
     CustomOptional<float> FGDLSSGFramerateTargetDMFG { 0.0f }; // 0.0 means auto-detects the display refresh rate
+    // OptiScaler's own Dynamic MFG, where Streamline has no eDynamic (Vulkan). Multipliers, 2 = 2X
+    CustomOptional<int> FGDLSSGDynamicMinMultiplier { 2 };
+    CustomOptional<int, NoDefault> FGDLSSGDynamicMaxMultiplier; // No value = the GPU's maximum
+    CustomOptional<bool> FGDLSSGDynamicCapOutput { true };      // Sets the FPS limit to the target
 
     // Reprojection
     CustomOptional<ReprojectionFill> ReprojectionFillMode { ReprojectionFill::Dithering };

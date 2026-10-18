@@ -140,6 +140,9 @@ class InputCommon
     // The reports of the markers OptiScaler tracked, NVAPI_BUFFER_SIZE of them, oldest first
     static InputResult get_frame_reports(const InputContext& inputContext, IUnknown* pDev, FrameReport* reports);
     static bool get_timing_data(TimingData& timingDataOut);
+    // Recent GPU render and CPU frame times in ms for OptiScaler's Dynamic MFG, 0 when unknown. The GPU time needs
+    // the Vulkan Reflex output's latency timings, OptiScaler's own marker reports only carry CPU times.
+    static bool get_render_costs(double& gpuRenderMs, double& cpuFrameMs);
     static uint64_t get_last_present_start_frame_id() { return last_present_start_frame_id; };
     static flag_set<LowLatencyInput> get_avaliable_inputs() { return avaliableInputs; };
     static LowLatencyMode active_output() { return activeOutput; }

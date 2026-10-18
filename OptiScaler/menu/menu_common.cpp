@@ -3575,6 +3575,116 @@ static bool RenderRatioOverrideSlider(const char* label, CustomOptional<int, NoD
     return true;
 }
 
+void MenuCommon::RenderOptiDynamicMfgSettings(RenderMenuContext& ctx, int maxMultiplier)
+{
+    auto& state = ctx.state;
+    auto config = ctx.config;
+    auto& menuResScale = ctx.menuResScale;
+
+    ImGui::Spacing();
+
+    // Multiplier range, steps are 2X to the GPU's maximum
+    const int stepCount = std::max(maxMultiplier - 1, 1);
+    auto multiplierName = [](int step) -> std::string { return std::format("{}X", step + 2); };
+
+    int lowest = std::clamp(config->FGDLSSGDynamicMinMultiplier.value_or_default(), 2, maxMultiplier) - 2;
+    int highest = std::clamp(config->FGDLSSGDynamicMaxMultiplier.value_or(maxMultiplier), 2, maxMultiplier) - 2;
+
+    ImGui::PushItemWidth(150.0f * menuResScale);
+
+    if (RenderStepSlider("Lowest##dmfg", lowest, stepCount, multiplierName))
+    {
+        config->FGDLSSGDynamicMinMultiplier = lowest + 2;
+
+        if (highest < lowest)
+            config->FGDLSSGDynamicMaxMultiplier = lowest + 2;
+    }
+
+    ShowTooltip("Fewest generated frames Dynamic MFG may use");
+    ImGui::SameLine(0.0f, 16.0f);
+
+    if (RenderStepSlider("Highest##dmfg", highest, stepCount, multiplierName))
+    {
+        if (highest + 2 == maxMultiplier)
+            config->FGDLSSGDynamicMaxMultiplier.reset();
+        else
+            config->FGDLSSGDynamicMaxMultiplier = highest + 2;
+
+        if (lowest > highest)
+            config->FGDLSSGDynamicMinMultiplier = highest + 2;
+    }
+
+    ShowTooltip("Most generated frames Dynamic MFG may use.\n"
+                "Each generated frame adds latency to every real one.");
+    ImGui::PopItemWidth();
+
+    if (bool cap = config->FGDLSSGDynamicCapOutput.value_or_default(); ImGui::Checkbox("Cap output at target", &cap))
+        config->FGDLSSGDynamicCapOutput = cap;
+
+    ShowTooltip("Sets the FPS limit to the target while Dynamic MFG runs, unless you set one yourself.\n"
+                "Real frames then run at target / multiplier and the output is paced evenly.\n"
+                "Without a cap the output can exceed the refresh rate and tear.");
+
+    // Live status from the present thread
+    State::OptiDynamicMfg dmfg;
+    {
+        std::lock_guard lock(state.optiDynamicMfgMutex);
+        dmfg = state.optiDynamicMfg;
+    }
+
+    if (!dmfg.running)
+    {
+        ImGui::TextDisabled("Starts with the next generated frame");
+        return;
+    }
+
+    const auto& s = dmfg.status;
+    const ImVec4 good = toneMapColor(ImVec4(0.f, 1.f, 0.25f, 1.f));
+    const ImVec4 warn = toneMapColor(ImVec4(1.f, 0.8f, 0.f, 1.f));
+
+    if (dmfg.targetFps <= 0.0f)
+    {
+        ImGui::TextColored(warn, "No target: the refresh rate is unknown, set one above");
+        return;
+    }
+
+    ImGui::TextColored(
+        good, "%s",
+        std::format("{}X for a {:.0f} fps target{}", s.multiplier, dmfg.targetFps, dmfg.autoTarget ? " (auto)" : "")
+            .c_str());
+
+    ImGui::Text("Real frames: %.0f fps, could do ~%.0f fps (%s)", s.baseFps, s.capacityFps,
+                s.fromCosts ? "from frame times" : "measured");
+
+    if (dmfg.costsAvailable)
+    {
+        ImGui::Text("Frame times: GPU %.2f ms, CPU %.2f ms, correction x%.2f", s.gpuRenderMs, s.cpuFrameMs,
+                    s.costFactor > 0.0 ? s.costFactor : 1.0);
+    }
+    else
+    {
+        ImGui::TextColored(warn, "No Reflex frame times: while capped, Dynamic MFG can add frames but not drop them");
+    }
+
+    if (s.lastChangeMs >= 0.0 && s.previousMultiplier > 0)
+    {
+        const double nowMs =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+
+        const char* why = s.reason == DynamicMfgController::Reason::BelowTarget ? "fell short of the target"
+                          : s.reason == DynamicMfgController::Reason::Headroom  ? "headroom for fewer frames"
+                          : s.reason == DynamicMfgController::Reason::Range     ? "range changed"
+                                                                                : "started";
+
+        ImGui::TextDisabled("%s", std::format("Last change {}X -> {}X, {} ({:.0f} s ago)", s.previousMultiplier,
+                                              s.multiplier, why, (nowMs - s.lastChangeMs) / 1000.0)
+                                      .c_str());
+    }
+
+    if (dmfg.ownsCap)
+        ImGui::TextDisabled("FPS limit set to %.0f by Dynamic MFG", dmfg.targetFps);
+}
+
 void MenuCommon::RenderFrameGenerationSelection(RenderMenuContext& ctx)
 {
     auto& state = ctx.state;
@@ -4629,31 +4739,47 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
             }
         }
 
+        // Streamline's Dynamic MFG is D3D12 only, elsewhere OptiScaler picks the multiplier itself
+        const bool nativeDynamicMfg = dlssg->GetDMFGSupport();
+        const bool canDynamicMfg = dlssg->GetMaxInterpolationCount() > 1;
+        const bool dynamicMfgOn = canDynamicMfg && config->FGDLSSGForceDMFG.value_or_default();
+
         ImGui::Text("Current DLSSG state:");
         ImGui::SameLine();
         if (auto count = state.dlssgDetectedInterpolationCount; count > 0)
         {
-            ImGui::TextColored(toneMapColor(ImVec4(0.f, 1.f, 0.25f, 1.f)), std::format("ON {}x", count + 1).c_str());
+            ImGui::TextColored(toneMapColor(ImVec4(0.f, 1.f, 0.25f, 1.f)),
+                               std::format("ON {}x{}", count + 1, dynamicMfgOn ? " (Dynamic)" : "").c_str());
         }
         else
         {
             ImGui::TextColored(toneMapColor(ImVec4(1.f, 0.f, 0.f, 1.f)), "OFF");
         }
 
+        // Dynamic MFG decides the multiplier while it runs
+        ImGui::BeginDisabled(dynamicMfgOn);
         RenderFGModeSlider(ctx, "Frame Gen##dlssg", dlssg->GetMaxInterpolationCount(),
                            &config->FGDLSSGInterpolationCount);
+        ImGui::EndDisabled();
 
-        if (dlssg->GetMaxInterpolationCount() > 1)
+        if (canDynamicMfg)
         {
-            if (dlssg->GetDMFGSupport())
             {
                 ImGui::SameLine(0.0f, 16.0f);
 
                 if (bool dynamicMFG = config->FGDLSSGForceDMFG.value_or_default();
-                    ImGui::Checkbox("Force Dynamic MFG", &dynamicMFG))
+                    ImGui::Checkbox(nativeDynamicMfg ? "Force Dynamic MFG" : "Dynamic MFG", &dynamicMFG))
                 {
                     config->FGDLSSGForceDMFG = dynamicMFG;
                     state.fgChanged = true;
+                }
+
+                if (!nativeDynamicMfg)
+                {
+                    ShowTooltip("Streamline's Dynamic MFG is D3D12 only, so OptiScaler picks the multiplier:\n"
+                                "the smallest one whose output reaches the FPS target, judged by Reflex's\n"
+                                "GPU and CPU frame times. More frames are added quickly when the game\n"
+                                "falls short, fewer only once the headroom has held for a while.");
                 }
 
                 ImGui::BeginDisabled(!config->FGDLSSGForceDMFG.value_or_default());
@@ -4661,7 +4787,11 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
                 float fpsSliderMax = (float) std::max(200, refreshRate);
                 ImGui::SliderFloat("DMFG FPS Target", &fpsTarget, 0, fpsSliderMax, "%.0f");
 
-                ShowTooltip("An active limit of 0 means auto-detect the display refresh rate");
+                if (nativeDynamicMfg)
+                    ShowTooltip("An active limit of 0 means auto-detect the display refresh rate");
+                else
+                    ShowTooltip("0 = auto: Reflex's VRR-safe cap below the refresh rate,\n"
+                                "refresh - refresh^2 / 3600 (211 fps at 225 Hz)");
 
                 if (ImGui::Button("Apply Target"))
                 {
@@ -4675,6 +4805,9 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
                     fpsTarget = 0.0f;
                     config->FGDLSSGFramerateTargetDMFG.reset();
                 }
+
+                if (!nativeDynamicMfg)
+                    RenderOptiDynamicMfgSettings(ctx, dlssg->GetMaxInterpolationCount() + 1);
 
                 ImGui::EndDisabled();
             }

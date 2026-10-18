@@ -216,6 +216,18 @@ bool Config::Reload(std::filesystem::path iniPath)
             FGDLSSGFramerateTargetDMFG.set_from_config(readFloat("DLSSG", "FramerateTargetDMFG"));
             FGDLSSGOverrideForceDMFG.set_from_config(readBool("DLSSG", "OverrideForceDMFG"));
             FGDLSSGForceDMFG.set_from_config(readBool("DLSSG", "ForceDMFG"));
+
+            FGDLSSGDynamicMinMultiplier.set_from_config(readInt("DLSSG", "DynamicMinMultiplier"));
+            if (FGDLSSGDynamicMinMultiplier.has_value() &&
+                (FGDLSSGDynamicMinMultiplier.value() < 2 || FGDLSSGDynamicMinMultiplier.value() > 6))
+                FGDLSSGDynamicMinMultiplier.reset();
+
+            FGDLSSGDynamicMaxMultiplier.set_from_config(readInt("DLSSG", "DynamicMaxMultiplier"));
+            if (FGDLSSGDynamicMaxMultiplier.has_value() &&
+                (FGDLSSGDynamicMaxMultiplier.value() < 2 || FGDLSSGDynamicMaxMultiplier.value() > 6))
+                FGDLSSGDynamicMaxMultiplier.reset();
+
+            FGDLSSGDynamicCapOutput.set_from_config(readBool("DLSSG", "DynamicCapOutput"));
         }
 
         {
@@ -1009,6 +1021,12 @@ bool Config::SaveIni()
         ini.SetValue("DLSSG", "OverrideForceDMFG",
                      GetBoolValue(Instance()->FGDLSSGOverrideForceDMFG.value_for_config()).c_str());
         ini.SetValue("DLSSG", "ForceDMFG", GetBoolValue(Instance()->FGDLSSGForceDMFG.value_for_config()).c_str());
+        ini.SetValue("DLSSG", "DynamicMinMultiplier",
+                     GetIntValue(Instance()->FGDLSSGDynamicMinMultiplier.value_for_config()).c_str());
+        ini.SetValue("DLSSG", "DynamicMaxMultiplier",
+                     GetIntValue(Instance()->FGDLSSGDynamicMaxMultiplier.value_for_config()).c_str());
+        ini.SetValue("DLSSG", "DynamicCapOutput",
+                     GetBoolValue(Instance()->FGDLSSGDynamicCapOutput.value_for_config()).c_str());
     }
 
     // Reprojection

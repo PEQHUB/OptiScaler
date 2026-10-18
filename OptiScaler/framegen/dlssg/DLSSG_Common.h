@@ -1,12 +1,33 @@
 #pragma once
 
 #include <framegen/IFGFeature.h>
+#include <framegen/DynamicMfg.h>
 
 #include <proxies/Streamline_Proxy.h>
 
 // The Streamline side of the DLSSG output, shared by the D3D12 and Vulkan ones
 class DLSSG_Common : public virtual IFGFeature
 {
+  private:
+    // OptiScaler's own Dynamic MFG where Streamline has no eDynamic (Vulkan)
+    DynamicMfgController _dynamicMfg;
+    bool _dynamicMfgRunning = false;
+    double _dynamicMfgLastFrameMs = -1.0;
+    double _dynamicMfgLastLogMs = 0.0;
+    bool _dynamicMfgOwnsCap = false;
+    float _dynamicMfgCap = 0.0f;               // The FPS limit it set
+    std::optional<float> _capBeforeDynamicMfg; // The FPS limit to restore
+    int _refreshRate = 0;
+    double _refreshCheckMs = -1.0;
+
+    bool UseOptiDynamicMfg() const;
+    // Interpolation count for this frame, fixedCount until the controller has decided
+    int UpdateOptiDynamicMfg(int fixedCount);
+    void StopOptiDynamicMfg();
+    void ReleaseDynamicMfgCap();
+    float DynamicMfgTarget(double nowMs, bool& autoTarget);
+    void PublishDynamicMfg(float targetFps, bool autoTarget, bool costsAvailable);
+
   protected:
     sl::ViewportHandle _viewport { 0 };
     sl::FrameToken* _frameToken = nullptr;

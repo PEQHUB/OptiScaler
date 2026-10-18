@@ -228,6 +228,8 @@ class MenuCommon
     static void RenderActiveUpscalerSettings(RenderMenuContext& ctx);
     static void RenderFrameGenerationSelection(RenderMenuContext& ctx);
     static void RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx);
+    // OptiScaler's own Dynamic MFG (outputs without Streamline's eDynamic): range, cap and live status
+    static void RenderOptiDynamicMfgSettings(RenderMenuContext& ctx, int maxMultiplier);
     static void RenderFGModeSlider(RenderMenuContext& ctx, const char* label, int maxInterpolationCount,
                                    CustomOptional<int>* countConfig);
     static void RenderFsrCommonSettings(RenderMenuContext& ctx);

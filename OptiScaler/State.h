@@ -5,6 +5,7 @@
 #include "misc/SkipSpoof.h"
 #include "framegen/IFGFeature_Dx12.h"
 #include "framegen/IFGFeature_Vk.h"
+#include "framegen/DynamicMfg.h"
 #include <inputs/FG/Streamline_Inputs.h>
 #include <inputs/FG/Streamline_Inputs_Sl1_Dx12.h>
 
@@ -296,6 +297,20 @@ class State
     bool dlssgGameDMFGSupported = false;
     sl::DLSSGMode dlssgLastSetMode = sl::DLSSGMode::eOff;
     int dlssgDetectedInterpolationCount = 0;
+
+    // OptiScaler's own Dynamic MFG, for DLSSG outputs without Streamline's eDynamic (Vulkan). Written on the present
+    // thread, read by the menu.
+    struct OptiDynamicMfg
+    {
+        bool running = false;
+        float targetFps = 0.0f;  // Effective target
+        bool autoTarget = false; // Target derived from the refresh rate
+        bool ownsCap = false;    // The FPS limit is the one Dynamic MFG set
+        bool costsAvailable = false;
+        DynamicMfgController::Status status {};
+    };
+    std::mutex optiDynamicMfgMutex;
+    OptiDynamicMfg optiDynamicMfg {};
 
     // What the game requested from DLSSG when it's used as FG Input
     // This might need to get moved to Sl_Inputs

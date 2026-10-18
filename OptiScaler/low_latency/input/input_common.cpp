@@ -902,6 +902,106 @@ InputResult InputCommon::get_frame_reports(const InputContext& inputContext, IUn
         timingDataOut.type.reset();                                                                                    \
     }
 
+bool InputCommon::get_render_costs(double& gpuRenderMs, double& cpuFrameMs)
+{
+    gpuRenderMs = 0.0;
+    cpuFrameMs = 0.0;
+
+    // Single frames are noisy, average the newest few complete ones
+    constexpr size_t averagedFrames = 8;
+
+    // A pipelined engine simulates and submits on different threads, so the slower stage limits it, not their sum
+    auto cpuCost = [](uint64_t simStart, uint64_t simEnd, uint64_t submitStart, uint64_t submitEnd)
+    {
+        uint64_t sim = simEnd > simStart && simStart != 0 ? simEnd - simStart : 0;
+        uint64_t submit = submitEnd > submitStart && submitStart != 0 ? submitEnd - submitStart : 0;
+        return std::max(sim, submit);
+    };
+
+    if (activeOutput == LowLatencyMode::Reflex && output_api == API::Vulkan)
+    {
+        if (auto reflexVk = std::dynamic_pointer_cast<ReflexVk>(currently_active_tech.load()))
+        {
+            std::array<VkLatencyTimingsFrameReportNV, NVAPI_BUFFER_SIZE> timings {};
+            for (auto& timing : timings)
+                timing.sType = VK_STRUCTURE_TYPE_LATENCY_TIMINGS_FRAME_REPORT_NV;
+
+            VkGetLatencyMarkerInfoNV info {};
+            info.sType = VK_STRUCTURE_TYPE_GET_LATENCY_MARKER_INFO_NV;
+            info.timingCount = (uint32_t) timings.size();
+            info.pTimings = timings.data();
+
+            if (reflexVk->get_latency(&info) == VK_SUCCESS)
+            {
+                const uint32_t count = std::min<uint32_t>(info.timingCount, (uint32_t) timings.size());
+
+                // Newest present ids first
+                std::sort(timings.begin(), timings.begin() + count,
+                          [](const auto& a, const auto& b) { return a.presentID > b.presentID; });
+
+                uint64_t gpuSumUs = 0, cpuSumUs = 0;
+                size_t gpuFrames = 0, cpuFrames = 0;
+
+                for (uint32_t i = 0; i < count && (gpuFrames < averagedFrames || cpuFrames < averagedFrames); i++)
+                {
+                    const auto& t = timings[i];
+
+                    if (gpuFrames < averagedFrames && t.gpuRenderStartTimeUs != 0 &&
+                        t.gpuRenderEndTimeUs > t.gpuRenderStartTimeUs)
+                    {
+                        gpuSumUs += t.gpuRenderEndTimeUs - t.gpuRenderStartTimeUs;
+                        gpuFrames++;
+                    }
+
+                    if (auto cpu = cpuCost(t.simStartTimeUs, t.simEndTimeUs, t.renderSubmitStartTimeUs,
+                                           t.renderSubmitEndTimeUs);
+                        cpuFrames < averagedFrames && cpu != 0)
+                    {
+                        cpuSumUs += cpu;
+                        cpuFrames++;
+                    }
+                }
+
+                if (gpuFrames > 0)
+                    gpuRenderMs = (double) gpuSumUs / gpuFrames / 1000.0;
+
+                if (cpuFrames > 0)
+                    cpuFrameMs = (double) cpuSumUs / cpuFrames / 1000.0;
+
+                if (gpuFrames > 0 || cpuFrames > 0)
+                    return true;
+            }
+        }
+    }
+
+    // OptiScaler's reports from the game's markers, CPU times in microseconds
+    FrameReport reports[NVAPI_BUFFER_SIZE] {};
+
+    if (!copy_frame_reports(reports))
+        return false;
+
+    uint64_t cpuSumUs = 0;
+    size_t cpuFrames = 0;
+
+    // Oldest first, so walk back from the newest
+    for (size_t i = NVAPI_BUFFER_SIZE; i-- > 0 && cpuFrames < averagedFrames;)
+    {
+        const auto& r = reports[i];
+
+        if (auto cpu = cpuCost(r.simStartTime, r.simEndTime, r.renderSubmitStartTime, r.renderSubmitEndTime); cpu != 0)
+        {
+            cpuSumUs += cpu;
+            cpuFrames++;
+        }
+    }
+
+    if (cpuFrames == 0)
+        return false;
+
+    cpuFrameMs = (double) cpuSumUs / cpuFrames / 1000.0;
+    return true;
+}
+
 bool InputCommon::get_timing_data(TimingData& timingDataOut)
 {
     InputContext tempContext {};
